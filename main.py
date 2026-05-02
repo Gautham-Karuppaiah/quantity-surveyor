@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
     QDockWidget, QListWidget, QListWidgetItem,
 )
-from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon
+from PyQt6.QtGui import QTask, QPixmap, QImage, QPen, QColor, QIcon
 from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
@@ -115,15 +115,15 @@ def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
     return entries
 
 
-class Action:
+class Task:
     def execute(self, project): raise NotImplementedError
 
 
-class Command(Action):
+class Command(Task):
     def undo(self, project): raise NotImplementedError
 
 
-class AddLegendEntries(Action):
+class AddLegendEntries(Task):
     def __init__(self, entries: list[LegendEntry]):
         self.entries = entries
 
@@ -150,7 +150,7 @@ class Project(QObject):
 
 
 class Tool(QObject):
-    action_ready = pyqtSignal(object)
+    task_ready = pyqtSignal(object)
     cursor: Qt.CursorShape | None = None
 
     def __init__(self):
@@ -206,7 +206,7 @@ class LegendSelectTool(RectSelectTool):
     def on_complete(self, rect: QRectF):
         crop = self._canvas.crop(rect)
         if not crop.isNull():
-            self.action_ready.emit(AddLegendEntries(extract_legend(crop)))
+            self.task_ready.emit(AddLegendEntries(extract_legend(crop)))
 
 
 class AppController(QObject):
@@ -223,14 +223,14 @@ class AppController(QObject):
     def set_tool(self, tool: Tool | None):
         self._canvas.set_tool(tool)
         if tool:
-            tool.action_ready.connect(self._on_action_ready)
+            tool.task_ready.connect(self._on_task_ready)
 
     def execute(self, cmd: Command):
         cmd.execute(self._project)
         self._undo.append(cmd)
         self._redo.clear()
 
-    def execute_no_undo(self, action: Action):
+    def execute_no_undo(self, action: Task):
         action.execute(self._project)
 
     def undo(self):
@@ -251,7 +251,7 @@ class AppController(QObject):
     def open_pdf(self, path: str):
         self._canvas.load_pixmap(render_page(path))
 
-    def _on_action_ready(self, action: Action):
+    def _on_task_ready(self, action: Task):
         if isinstance(action, Command):
             self.execute(action)
         else:
@@ -401,28 +401,28 @@ class MainWindow(QMainWindow):
         self.viewer.escape_pressed.connect(self._controller.cancel_tool)
 
         view_menu = self.menuBar().addMenu("View")
-        view_menu.addAction(self.legend_panel.toggleViewAction())
+        view_menu.addTask(self.legend_panel.toggleViewTask())
 
         toolbar = QToolBar()
         self.addToolBar(toolbar)
 
-        open_action = QAction("Open PDF", self)
+        open_action = QTask("Open PDF", self)
         open_action.triggered.connect(self._open_pdf)
-        toolbar.addAction(open_action)
+        toolbar.addTask(open_action)
 
-        legend_action = QAction("Load Legend", self)
+        legend_action = QTask("Load Legend", self)
         legend_action.triggered.connect(lambda: self._controller.set_tool(LegendSelectTool()))
-        toolbar.addAction(legend_action)
+        toolbar.addTask(legend_action)
 
-        undo_action = QAction("Undo", self)
+        undo_action = QTask("Undo", self)
         undo_action.setShortcut("Ctrl+Z")
         undo_action.triggered.connect(self._controller.undo)
-        self.addAction(undo_action)
+        self.addTask(undo_action)
 
-        redo_action = QAction("Redo", self)
+        redo_action = QTask("Redo", self)
         redo_action.setShortcut("Ctrl+Y")
         redo_action.triggered.connect(self._controller.redo)
-        self.addAction(redo_action)
+        self.addTask(redo_action)
 
     def _open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
