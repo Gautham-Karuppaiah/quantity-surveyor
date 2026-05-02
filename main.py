@@ -115,20 +115,21 @@ def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
     return entries
 
 
-class Command:
+class Action:
     def execute(self, project): raise NotImplementedError
+
+
+class Command(Action):
     def undo(self, project): raise NotImplementedError
 
 
-class AddLegendEntries(Command):
+class AddLegendEntries(Action):
     def __init__(self, entries: list[LegendEntry]):
         self.entries = entries
 
     def execute(self, project):
         project.add_legend_entries(self.entries)
 
-    def undo(self, project):
-        project.remove_legend_entries(len(self.entries))
 
 
 class Project(QObject):
@@ -146,13 +147,10 @@ class Project(QObject):
         self._legend_entries.extend(entries)
         self.legend_entries_changed.emit()
 
-    def remove_legend_entries(self, count: int):
-        del self._legend_entries[-count:]
-        self.legend_entries_changed.emit()
 
 
 class Tool(QObject):
-    command_ready = pyqtSignal(object)
+    action_ready = pyqtSignal(object)
     cursor: Qt.CursorShape | None = None
 
     def __init__(self):
@@ -208,7 +206,7 @@ class LegendSelectTool(RectSelectTool):
     def on_complete(self, rect: QRectF):
         crop = self._canvas.crop(rect)
         if not crop.isNull():
-            self.command_ready.emit(AddLegendEntries(extract_legend(crop)))
+            self.action_ready.emit(AddLegendEntries(extract_legend(crop)))
 
 
 class AppController(QObject):
@@ -225,12 +223,15 @@ class AppController(QObject):
     def set_tool(self, tool: Tool | None):
         self._canvas.set_tool(tool)
         if tool:
-            tool.command_ready.connect(self._on_command_ready)
+            tool.action_ready.connect(self._on_action_ready)
 
     def execute(self, cmd: Command):
         cmd.execute(self._project)
         self._undo.append(cmd)
         self._redo.clear()
+
+    def execute_no_undo(self, action: Action):
+        action.execute(self._project)
 
     def undo(self):
         if self._undo:
@@ -250,8 +251,11 @@ class AppController(QObject):
     def open_pdf(self, path: str):
         self._canvas.load_pixmap(render_page(path))
 
-    def _on_command_ready(self, cmd: Command):
-        self.execute(cmd)
+    def _on_action_ready(self, action: Action):
+        if isinstance(action, Command):
+            self.execute(action)
+        else:
+            self.execute_no_undo(action)
         self.set_tool(None)
 
 
