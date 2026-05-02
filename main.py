@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QDockWidget, QListWidget, QListWidgetItem,
 )
 from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon
-from PyQt6.QtCore import Qt, QRectF, QSize
+from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
@@ -28,6 +28,7 @@ class LegendEntry:
     image: np.ndarray
     mask: np.ndarray
     pixmap: QPixmap
+    auto_count: bool = True
 
 
 def remove_border(img: np.ndarray) -> np.ndarray:
@@ -62,6 +63,16 @@ def tight_crop(img: np.ndarray, pad: int = 4) -> np.ndarray:
     return img[rmin:rmax + 1, cmin:cmax + 1]
 
 
+def qpixmap_to_bgr(pixmap: QPixmap) -> np.ndarray:
+    qimg = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+    w, h = qimg.width(), qimg.height()
+    stride = qimg.bytesPerLine()
+    ptr = qimg.bits()
+    ptr.setsize(h * stride)
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, stride))[:, :w * 3].reshape((h, w, 3)).copy()
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
 def bgr_to_qpixmap(arr: np.ndarray) -> QPixmap:
     rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
     h, w = rgb.shape[:2]
@@ -79,120 +90,255 @@ def render_page(path: str, page_index: int = 0) -> QPixmap:
     return QPixmap.fromImage(img)
 
 
-class RectSelectTool:
-    def __init__(self, viewer, callback):
-        self._viewer = viewer
-        self._callback = callback
-        self._anchor = None
-        self._rect_item = None
+def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
+    bgr = qpixmap_to_bgr(pixmap)
+    _, buf = cv2.imencode(".png", bgr)
+    ocr = EasyOCR(lang=["en"])
+    doc = TableImage(src=buf.tobytes())
+    tables = doc.extract_tables(ocr=ocr)
+    entries = []
+    for table in tables:
+        for row in table.content.values():
+            if len(row) < 2:
+                continue
+            symbol_cell, label_cell = row[0], row[1]
+            label = " ".join((label_cell.value or "").split())
+            bx1, by1 = symbol_cell.bbox.x1, symbol_cell.bbox.y1
+            bx2, by2 = symbol_cell.bbox.x2, symbol_cell.bbox.y2
+            cell_bgr = bgr[by1:by2, bx1:bx2]
+            if cell_bgr.size == 0:
+                continue
+            clean = tight_crop(remove_border(cell_bgr))
+            mask = (clean.min(axis=2) < WHITE_THRESHOLD).astype(np.uint8) * 255
+            entry_pixmap = bgr_to_qpixmap(clean)
+            entries.append(LegendEntry(label=label, image=clean, mask=mask, pixmap=entry_pixmap))
+    return entries
 
-    def activate(self):
-        self._viewer.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self._viewer.setCursor(Qt.CursorShape.CrossCursor)
+
+class Command:
+    def execute(self, project): raise NotImplementedError
+    def undo(self, project): raise NotImplementedError
+
+
+class AddLegendEntries(Command):
+    def __init__(self, entries: list[LegendEntry]):
+        self.entries = entries
+
+    def execute(self, project):
+        project.add_legend_entries(self.entries)
+
+    def undo(self, project):
+        project.remove_legend_entries(len(self.entries))
+
+
+class Project(QObject):
+    legend_entries_changed = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._legend_entries: list[LegendEntry] = []
+
+    @property
+    def legend_entries(self):
+        return self._legend_entries
+
+    def add_legend_entries(self, entries: list[LegendEntry]):
+        self._legend_entries.extend(entries)
+        self.legend_entries_changed.emit()
+
+    def remove_legend_entries(self, count: int):
+        del self._legend_entries[-count:]
+        self.legend_entries_changed.emit()
+
+
+class Tool(QObject):
+    command_ready = pyqtSignal(object)
+    cursor: Qt.CursorShape | None = None
+
+    def __init__(self):
+        super().__init__()
+        self._canvas = None
+
+    def activate(self, canvas):
+        self._canvas = canvas
 
     def deactivate(self):
-        self._viewer.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-        self._viewer.unsetCursor()
-        if self._rect_item:
-            self._viewer.remove_scene_item(self._rect_item)
-            self._rect_item = None
+        self._canvas = None
+
+    def on_press(self, pos: QPointF): pass
+    def on_move(self, pos: QPointF): pass
+    def on_release(self, pos: QPointF): pass
+
+
+
+class RectSelectTool(Tool):
+    cursor = Qt.CursorShape.CrossCursor
+
+    def __init__(self):
+        super().__init__()
+        self._anchor: QPointF | None = None
+
+    def deactivate(self):
         self._anchor = None
+        if self._canvas:
+            self._canvas.clear_preview()
+        super().deactivate()
 
-    def handle(self, event_type, event):
-        match event_type:
-            case "press":
-                self._on_press(event)
-            case "move":
-                self._on_move(event)
-            case "release":
-                self._on_release(event)
+    def on_press(self, pos: QPointF):
+        self._anchor = pos
 
-    def _on_press(self, event):
-        if event.button() != Qt.MouseButton.LeftButton:
+    def on_move(self, pos: QPointF):
+        if self._anchor is None:
             return
-        self._anchor = self._viewer.mapToScene(event.pos())
-        pen = QPen(QColor(0, 120, 255))
-        pen.setWidth(2)
-        pen.setStyle(Qt.PenStyle.DashLine)
-        self._rect_item = QGraphicsRectItem()
-        self._rect_item.setPen(pen)
-        self._rect_item.setBrush(QColor(0, 120, 255, 30))
-        self._viewer.add_scene_item(self._rect_item)
+        self._canvas.show_rect_preview(QRectF(self._anchor, pos).normalized())
 
-    def _on_move(self, event):
-        if not self._anchor or not self._rect_item:
+    def on_release(self, pos: QPointF):
+        if self._anchor is None:
             return
-        current = self._viewer.mapToScene(event.pos())
-        self._rect_item.setRect(QRectF(self._anchor, current).normalized())
+        rect = QRectF(self._anchor, pos).normalized()
+        self._anchor = None
+        self._canvas.clear_preview()
+        self.on_complete(rect)
 
-    def _on_release(self, event):
-        if not self._anchor or event.button() != Qt.MouseButton.LeftButton:
-            return
-        current = self._viewer.mapToScene(event.pos())
-        rect = QRectF(self._anchor, current).normalized()
-        callback = self._callback
-        self._viewer.set_tool(None)
-        callback(rect)
+    def on_complete(self, rect: QRectF):
+        pass
+
+
+class LegendSelectTool(RectSelectTool):
+    def on_complete(self, rect: QRectF):
+        crop = self._canvas.crop(rect)
+        if not crop.isNull():
+            self.command_ready.emit(AddLegendEntries(extract_legend(crop)))
+
+
+class AppController(QObject):
+    def __init__(self, project: Project):
+        super().__init__()
+        self._project = project
+        self._undo: list[Command] = []
+        self._redo: list[Command] = []
+        self._canvas = None
+
+    def set_canvas(self, canvas):
+        self._canvas = canvas
+
+    def set_tool(self, tool: Tool | None):
+        self._canvas.set_tool(tool)
+        if tool:
+            tool.command_ready.connect(self._on_command_ready)
+
+    def execute(self, cmd: Command):
+        cmd.execute(self._project)
+        self._undo.append(cmd)
+        self._redo.clear()
+
+    def undo(self):
+        if self._undo:
+            cmd = self._undo.pop()
+            cmd.undo(self._project)
+            self._redo.append(cmd)
+
+    def redo(self):
+        if self._redo:
+            cmd = self._redo.pop()
+            cmd.execute(self._project)
+            self._undo.append(cmd)
+
+    def cancel_tool(self):
+        self.set_tool(None)
+
+    def open_pdf(self, path: str):
+        self._canvas.load_pixmap(render_page(path))
+
+    def _on_command_ready(self, cmd: Command):
+        self.execute(cmd)
+        self.set_tool(None)
 
 
 class PDFViewer(QGraphicsView):
+    escape_pressed = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
         self.setScene(self._scene)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-        self._item = None
-        self._tool = None
+        self._page_item: QGraphicsPixmapItem | None = None
+        self._rect_item: QGraphicsRectItem | None = None
+        self._active_tool: Tool | None = None
 
-    def set_tool(self, tool):
-        if self._tool:
-            self._tool.deactivate()
-        self._tool = tool
+    def set_tool(self, tool: Tool | None):
+        if self._active_tool:
+            self._active_tool.deactivate()
+        self._active_tool = tool
         if tool:
-            tool.activate()
-
-    def add_scene_item(self, item):
-        self._scene.addItem(item)
-
-    def remove_scene_item(self, item):
-        self._scene.removeItem(item)
+            tool.activate(self)
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            if tool.cursor is not None:
+                self.setCursor(tool.cursor)
+            else:
+                self.unsetCursor()
+        else:
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.unsetCursor()
 
     def load_pixmap(self, pixmap: QPixmap):
         self._scene.clear()
-        self._item = QGraphicsPixmapItem(pixmap)
-        self._scene.addItem(self._item)
-        self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._rect_item = None
+        self._page_item = QGraphicsPixmapItem(pixmap)
+        self._scene.addItem(self._page_item)
+        self.fitInView(self._page_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def crop(self, rect: QRectF) -> QPixmap:
+        if self._page_item is None:
+            return QPixmap()
+        return self._page_item.pixmap().copy(rect.toRect())
+
+    def show_rect_preview(self, rect: QRectF):
+        if self._rect_item is None:
+            pen = QPen(QColor(0, 120, 255))
+            pen.setWidth(2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            self._rect_item = QGraphicsRectItem()
+            self._rect_item.setPen(pen)
+            self._rect_item.setBrush(QColor(0, 120, 255, 30))
+            self._scene.addItem(self._rect_item)
+        self._rect_item.setRect(rect)
+
+    def clear_preview(self):
+        if self._rect_item:
+            self._scene.removeItem(self._rect_item)
+            self._rect_item = None
+
+    def zoom(self, delta: int):
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        self.scale(factor, factor)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self._tool:
-            self.set_tool(None)
+        if event.key() == Qt.Key.Key_Escape:
+            self.escape_pressed.emit()
         else:
             super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
-        if self._tool:
-            self._tool.handle("press", event)
+        if event.button() == Qt.MouseButton.LeftButton and self._active_tool:
+            self._active_tool.on_press(self.mapToScene(event.pos()))
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._tool:
-            self._tool.handle("move", event)
-        else:
-            super().mouseMoveEvent(event)
+        if self._active_tool:
+            self._active_tool.on_move(self.mapToScene(event.pos()))
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if self._tool:
-            self._tool.handle("release", event)
+        if event.button() == Qt.MouseButton.LeftButton and self._active_tool:
+            self._active_tool.on_release(self.mapToScene(event.pos()))
         else:
             super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
-        if self._tool:
-            self._tool.handle("wheel", event)
-        else:
-            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-            self.scale(factor, factor)
+        self.zoom(event.angleDelta().y())
 
 
 class LegendList(QListWidget):
@@ -232,16 +378,23 @@ class LegendPanel(QDockWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._project = Project()
+        self._controller = AppController(self._project)
+
         self.setWindowTitle("QS Automation")
         self.resize(1200, 900)
 
         self.viewer = PDFViewer()
         self.setCentralWidget(self.viewer)
+        self._controller.set_canvas(self.viewer)
 
         self.legend_panel = LegendPanel()
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.legend_panel)
 
-        self._legend_entries: list[LegendEntry] = []
+        self._project.legend_entries_changed.connect(
+            lambda: self.legend_panel.set_entries(self._project.legend_entries)
+        )
+        self.viewer.escape_pressed.connect(self._controller.cancel_tool)
 
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self.legend_panel.toggleViewAction())
@@ -250,61 +403,29 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         open_action = QAction("Open PDF", self)
-        open_action.triggered.connect(self.open_pdf)
+        open_action.triggered.connect(self._open_pdf)
         toolbar.addAction(open_action)
 
         legend_action = QAction("Load Legend", self)
-        legend_action.triggered.connect(self.load_legend)
+        legend_action.triggered.connect(lambda: self._controller.set_tool(LegendSelectTool()))
         toolbar.addAction(legend_action)
 
-    def open_pdf(self):
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.triggered.connect(self._controller.undo)
+        self.addAction(undo_action)
+
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut("Ctrl+Y")
+        redo_action.triggered.connect(self._controller.redo)
+        self.addAction(redo_action)
+
+    def _open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
         if not path:
             return
-        pixmap = render_page(path)
-        self.viewer.load_pixmap(pixmap)
+        self._controller.open_pdf(path)
         self.setWindowTitle(f"QS Automation — {path}")
-
-    def load_legend(self):
-        self.viewer.set_tool(RectSelectTool(self.viewer, self.on_legend_rect))
-
-    def on_legend_rect(self, rect: QRectF):
-        if not self.viewer._item:
-            return
-
-        crop = self.viewer._item.pixmap().copy(rect.toRect())
-        qimg = crop.toImage().convertToFormat(QImage.Format.Format_RGB888)
-        cw, ch = qimg.width(), qimg.height()
-        stride = qimg.bytesPerLine()
-        ptr = qimg.bits()
-        ptr.setsize(ch * stride)
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((ch, stride))[:, :cw * 3].reshape((ch, cw, 3)).copy()
-        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-
-        _, buf = cv2.imencode(".png", bgr)
-        ocr = EasyOCR(lang=["en"])
-        doc = TableImage(src=buf.tobytes())
-        tables = doc.extract_tables(ocr=ocr)
-
-        entries = []
-        for table in tables:
-            for row in table.content.values():
-                if len(row) < 2:
-                    continue
-                symbol_cell, label_cell = row[0], row[1]
-                label = " ".join((label_cell.value or "").split())
-                bx1, by1 = symbol_cell.bbox.x1, symbol_cell.bbox.y1
-                bx2, by2 = symbol_cell.bbox.x2, symbol_cell.bbox.y2
-                cell_bgr = bgr[by1:by2, bx1:bx2]
-                if cell_bgr.size == 0:
-                    continue
-                clean = tight_crop(remove_border(cell_bgr))
-                mask = (clean.min(axis=2) < WHITE_THRESHOLD).astype(np.uint8) * 255
-                pixmap = bgr_to_qpixmap(clean)
-                entries.append(LegendEntry(label=label, image=clean, mask=mask, pixmap=pixmap))
-
-        self._legend_entries.extend(entries)
-        self.legend_panel.set_entries(self._legend_entries)
 
 
 if __name__ == "__main__":
