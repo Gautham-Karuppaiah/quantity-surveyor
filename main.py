@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
     QDockWidget, QListWidget, QListWidgetItem,
 )
-from PyQt6.QtGui import QTask, QPixmap, QImage, QPen, QColor, QIcon
+from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon
 from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
@@ -401,28 +401,28 @@ class MainWindow(QMainWindow):
         self.viewer.escape_pressed.connect(self._controller.cancel_tool)
 
         view_menu = self.menuBar().addMenu("View")
-        view_menu.addTask(self.legend_panel.toggleViewTask())
+        view_menu.addAction(self.legend_panel.toggleViewAction())
 
         toolbar = QToolBar()
         self.addToolBar(toolbar)
 
-        open_action = QTask("Open PDF", self)
+        open_action = QAction("Open PDF", self)
         open_action.triggered.connect(self._open_pdf)
-        toolbar.addTask(open_action)
+        toolbar.addAction(open_action)
 
-        legend_action = QTask("Load Legend", self)
+        legend_action = QAction("Load Legend", self)
         legend_action.triggered.connect(lambda: self._controller.set_tool(LegendSelectTool()))
-        toolbar.addTask(legend_action)
+        toolbar.addAction(legend_action)
 
-        undo_action = QTask("Undo", self)
+        undo_action = QAction("Undo", self)
         undo_action.setShortcut("Ctrl+Z")
         undo_action.triggered.connect(self._controller.undo)
-        self.addTask(undo_action)
+        self.addAction(undo_action)
 
-        redo_action = QTask("Redo", self)
+        redo_action = QAction("Redo", self)
         redo_action.setShortcut("Ctrl+Y")
         redo_action.triggered.connect(self._controller.redo)
-        self.addTask(redo_action)
+        self.addAction(redo_action)
 
     def _open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
