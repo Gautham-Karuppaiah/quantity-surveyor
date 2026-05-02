@@ -151,7 +151,9 @@ class Project(QObject):
 
 class Tool(QObject):
     task_ready = pyqtSignal(object)
+    done = pyqtSignal()
     cursor: Qt.CursorShape | None = None
+    persistent: bool = False
 
     def __init__(self):
         super().__init__()
@@ -162,6 +164,10 @@ class Tool(QObject):
 
     def deactivate(self):
         self._canvas = None
+
+    def on_task_emitted(self):
+        if not self.persistent:
+            self.done.emit()
 
     def on_press(self, pos: QPointF): pass
     def on_move(self, pos: QPointF): pass
@@ -207,6 +213,7 @@ class LegendSelectTool(RectSelectTool):
         crop = self._canvas.crop(rect)
         if not crop.isNull():
             self.task_ready.emit(AddLegendEntries(extract_legend(crop)))
+            self.on_task_emitted()
 
 
 class AppController(QObject):
@@ -224,6 +231,7 @@ class AppController(QObject):
         self._canvas.set_tool(tool)
         if tool:
             tool.task_ready.connect(self._on_task_ready)
+            tool.done.connect(lambda: self.set_tool(None))
 
     def execute(self, cmd: Command):
         cmd.execute(self._project)
@@ -256,7 +264,6 @@ class AppController(QObject):
             self.execute(action)
         else:
             self.execute_no_undo(action)
-        self.set_tool(None)
 
 
 class PDFViewer(QGraphicsView):
