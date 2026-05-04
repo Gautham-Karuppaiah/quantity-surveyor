@@ -1,5 +1,6 @@
 import os
 import signal
+import sqlite3
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -133,6 +134,43 @@ def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
     return entries
 
 
+def init_db(conn: sqlite3.Connection):
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS folders (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS drawings (
+            id INTEGER PRIMARY KEY,
+            filename TEXT NOT NULL,
+            last_page INTEGER NOT NULL DEFAULT 0,
+            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS pages (
+            id INTEGER PRIMARY KEY,
+            drawing_id INTEGER NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
+            page_number INTEGER NOT NULL,
+            image BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS legend_entries (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL,
+            image BLOB NOT NULL,
+            mask BLOB NOT NULL,
+            auto_count INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS project (
+            last_opened_drawing_id INTEGER REFERENCES drawings(id)
+        );
+    """)
+    (count,) = conn.execute("SELECT COUNT(*) FROM project").fetchone()
+    if count == 0:
+        conn.execute("INSERT INTO project VALUES (NULL)")
+    conn.commit()
+
+
 class Task:
     def execute(self, project): raise NotImplementedError
 
@@ -156,6 +194,9 @@ class Project(QObject):
     def __init__(self):
         super().__init__()
         self._legend_entries: list[LegendEntry] = []
+        self.drawings: list[Drawing] = []
+        self.active_drawing: Drawing | None = None
+        self.active_page: Page | None = None
 
     @property
     def legend_entries(self):
@@ -238,8 +279,6 @@ class AppController(QObject):
     def __init__(self, project: Project):
         super().__init__()
         self._project = project
-        self._undo: list[Command] = []
-        self._redo: list[Command] = []
         self._canvas = None
 
     def set_canvas(self, canvas):
@@ -252,24 +291,28 @@ class AppController(QObject):
             tool.done.connect(lambda: self.set_tool(None))
 
     def execute(self, cmd: Command):
+        page = self._project.active_page
         cmd.execute(self._project)
-        self._undo.append(cmd)
-        self._redo.clear()
+        if page:
+            page.undo_stack.append(cmd)
+            page.redo_stack.clear()
 
-    def execute_no_undo(self, action: Task):
-        action.execute(self._project)
+    def execute_no_undo(self, task: Task):
+        task.execute(self._project)
 
     def undo(self):
-        if self._undo:
-            cmd = self._undo.pop()
+        page = self._project.active_page
+        if page and page.undo_stack:
+            cmd = page.undo_stack.pop()
             cmd.undo(self._project)
-            self._redo.append(cmd)
+            page.redo_stack.append(cmd)
 
     def redo(self):
-        if self._redo:
-            cmd = self._redo.pop()
+        page = self._project.active_page
+        if page and page.redo_stack:
+            cmd = page.redo_stack.pop()
             cmd.execute(self._project)
-            self._undo.append(cmd)
+            page.undo_stack.append(cmd)
 
     def cancel_tool(self):
         self.set_tool(None)
