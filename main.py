@@ -1,6 +1,7 @@
 import os
 import signal
 import sys
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -20,6 +21,23 @@ os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
 DPI = 300
 WHITE_THRESHOLD = 240
+
+
+class Page:
+    def __init__(self, id: int, pixmap: QPixmap | None = None):
+        self.id = id
+        self.pixmap = pixmap
+        self.undo_stack = deque(maxlen=100)
+        self.redo_stack = deque()
+
+
+class Drawing:
+    def __init__(self, id: int, filename: str, folder_id: int | None = None):
+        self.id = id
+        self.filename = filename
+        self.folder_id = folder_id
+        self.pages: list[Page] = []
+        self.last_page_index: int = 0
 
 
 @dataclass
