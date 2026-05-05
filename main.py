@@ -14,13 +14,14 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QFileDialog,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
     QDockWidget, QListWidget, QListWidgetItem,
+    QWidget, QVBoxLayout, QPushButton, QLabel,
 )
-from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon
+from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon, QImageReader
 from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
-DPI = 300
+DPI = 200
 WHITE_THRESHOLD = 240
 
 
@@ -99,14 +100,35 @@ def bgr_to_qpixmap(arr: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
-def render_page(path: str, page_index: int = 0) -> QPixmap:
+def render_page_bytes(path: str, page_index: int) -> bytes:
     doc = fitz.open(path)
     page = doc[page_index]
     mat = fitz.Matrix(DPI / 72, DPI / 72)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+    png_bytes = pix.tobytes("png")
     doc.close()
-    return QPixmap.fromImage(img)
+    return png_bytes
+
+
+def pixmap_from_bytes(data: bytes) -> QPixmap:
+    pixmap = QPixmap()
+    pixmap.loadFromData(data)
+    return pixmap
+
+
+def insert_drawing(conn: sqlite3.Connection, filename: str) -> int:
+    cursor = conn.execute("INSERT INTO drawings (filename) VALUES (?)", (filename,))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def insert_page(conn: sqlite3.Connection, drawing_id: int, page_number: int, image: bytes) -> int:
+    cursor = conn.execute(
+        "INSERT INTO pages (drawing_id, page_number, image) VALUES (?, ?, ?)",
+        (drawing_id, page_number, image),
+    )
+    conn.commit()
+    return cursor.lastrowid
 
 
 def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
@@ -172,35 +194,70 @@ def init_db(conn: sqlite3.Connection):
 
 
 class Task:
-    def execute(self, project): raise NotImplementedError
+    def execute(self, project, conn): raise NotImplementedError
 
 
 class Command(Task):
-    def undo(self, project): raise NotImplementedError
+    def undo(self, project, conn): raise NotImplementedError
 
 
 class AddLegendEntries(Task):
     def __init__(self, entries: list[LegendEntry]):
         self.entries = entries
 
-    def execute(self, project):
+    def execute(self, project, conn):
         project.add_legend_entries(self.entries)
 
+
+class ImportDrawing(Task):
+    def __init__(self, path: str):
+        self.path = path
+
+    def execute(self, project, conn):
+        doc = fitz.open(self.path)
+        page_count = len(doc)
+        doc.close()
+
+        drawing_id = insert_drawing(conn, self.path)
+        drawing = Drawing(id=drawing_id, filename=self.path)
+
+        for i in range(page_count):
+            image_bytes = render_page_bytes(self.path, i)
+            page_id = insert_page(conn, drawing_id, i, image_bytes)
+            drawing.pages.append(Page(id=page_id))
+
+        project.drawings.append(drawing)
+        project.active_drawing = drawing
+        if drawing.pages:
+            first_page = drawing.pages[0]
+            (first_image,) = conn.execute("SELECT image FROM pages WHERE id = ?", (first_page.id,)).fetchone()
+            first_page.pixmap = pixmap_from_bytes(first_image)
+            project.active_page = first_page
 
 
 class Project(QObject):
     legend_entries_changed = pyqtSignal()
+    active_page_changed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self._legend_entries: list[LegendEntry] = []
+        self._active_page: Page | None = None
         self.drawings: list[Drawing] = []
         self.active_drawing: Drawing | None = None
-        self.active_page: Page | None = None
 
     @property
     def legend_entries(self):
         return self._legend_entries
+
+    @property
+    def active_page(self):
+        return self._active_page
+
+    @active_page.setter
+    def active_page(self, page: Page | None):
+        self._active_page = page
+        self.active_page_changed.emit()
 
     def add_legend_entries(self, entries: list[LegendEntry]):
         self._legend_entries.extend(entries)
@@ -276,13 +333,17 @@ class LegendSelectTool(RectSelectTool):
 
 
 class AppController(QObject):
-    def __init__(self, project: Project):
+    def __init__(self, project: Project, conn: sqlite3.Connection | None = None):
         super().__init__()
         self._project = project
+        self._conn = conn
         self._canvas = None
 
     def set_canvas(self, canvas):
         self._canvas = canvas
+
+    def set_conn(self, conn: sqlite3.Connection):
+        self._conn = conn
 
     def set_tool(self, tool: Tool | None):
         self._canvas.set_tool(tool)
@@ -290,41 +351,35 @@ class AppController(QObject):
             tool.task_ready.connect(self._on_task_ready)
             tool.done.connect(lambda: self.set_tool(None))
 
-    def execute(self, cmd: Command):
-        page = self._project.active_page
-        cmd.execute(self._project)
-        if page:
-            page.undo_stack.append(cmd)
-            page.redo_stack.clear()
-
-    def execute_no_undo(self, task: Task):
-        task.execute(self._project)
+    def dispatch(self, task: Task):
+        if isinstance(task, Command):
+            page = self._project.active_page
+            task.execute(self._project, self._conn)
+            if page:
+                page.undo_stack.append(task)
+                page.redo_stack.clear()
+        else:
+            task.execute(self._project, self._conn)
 
     def undo(self):
         page = self._project.active_page
         if page and page.undo_stack:
             cmd = page.undo_stack.pop()
-            cmd.undo(self._project)
+            cmd.undo(self._project, self._conn)
             page.redo_stack.append(cmd)
 
     def redo(self):
         page = self._project.active_page
         if page and page.redo_stack:
             cmd = page.redo_stack.pop()
-            cmd.execute(self._project)
+            cmd.execute(self._project, self._conn)
             page.undo_stack.append(cmd)
 
     def cancel_tool(self):
         self.set_tool(None)
 
-    def open_pdf(self, path: str):
-        self._canvas.load_pixmap(render_page(path))
-
-    def _on_task_ready(self, action: Task):
-        if isinstance(action, Command):
-            self.execute(action)
-        else:
-            self.execute_no_undo(action)
+    def _on_task_ready(self, task: Task):
+        self.dispatch(task)
 
 
 class PDFViewer(QGraphicsView):
@@ -447,13 +502,62 @@ class LegendPanel(QDockWidget):
             self._list.addItem(item)
 
 
-class MainWindow(QMainWindow):
+class LandingWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self._project = Project()
-        self._controller = AppController(self._project)
-
         self.setWindowTitle("QS Automation")
+        self.resize(400, 300)
+
+        central = QWidget()
+        layout = QVBoxLayout()
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title = QLabel("QS Automation")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        new_btn = QPushButton("New Project")
+        open_btn = QPushButton("Open Project")
+        new_btn.clicked.connect(self._new_project)
+        open_btn.clicked.connect(self._open_project)
+
+        layout.addWidget(title)
+        layout.addSpacing(20)
+        layout.addWidget(new_btn)
+        layout.addWidget(open_btn)
+        central.setLayout(layout)
+        self.setCentralWidget(central)
+
+    def _new_project(self):
+        path, _ = QFileDialog.getSaveFileName(self, "New Project", "", "QS Project (*.qsproj)")
+        if not path:
+            return
+        if not path.endswith(".qsproj"):
+            path = os.path.splitext(path)[0] + ".qsproj"
+        conn = sqlite3.connect(path)
+        init_db(conn)
+        self._launch(conn, path)
+
+    def _open_project(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "QS Project (*.qsproj)")
+        if not path:
+            return
+        conn = sqlite3.connect(path)
+        init_db(conn)
+        self._launch(conn, path)
+
+    def _launch(self, conn, path):
+        self._main = MainWindow(conn, path)
+        self._main.show()
+        self.close()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, conn: sqlite3.Connection, project_path: str):
+        super().__init__()
+        self._project = Project()
+        self._controller = AppController(self._project, conn)
+
+        self.setWindowTitle(f"QS Automation — {project_path}")
         self.resize(1200, 900)
 
         self.viewer = PDFViewer()
@@ -466,6 +570,10 @@ class MainWindow(QMainWindow):
         self._project.legend_entries_changed.connect(
             lambda: self.legend_panel.set_entries(self._project.legend_entries)
         )
+        self._project.active_page_changed.connect(
+            lambda: self.viewer.load_pixmap(self._project.active_page.pixmap)
+            if self._project.active_page else None
+        )
         self.viewer.escape_pressed.connect(self._controller.cancel_tool)
 
         view_menu = self.menuBar().addMenu("View")
@@ -474,9 +582,9 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar()
         self.addToolBar(toolbar)
 
-        open_action = QAction("Open PDF", self)
-        open_action.triggered.connect(self._open_pdf)
-        toolbar.addAction(open_action)
+        import_action = QAction("Import Drawing", self)
+        import_action.triggered.connect(self._import_drawing)
+        toolbar.addAction(import_action)
 
         legend_action = QAction("Load Legend", self)
         legend_action.triggered.connect(lambda: self._controller.set_tool(LegendSelectTool()))
@@ -492,17 +600,17 @@ class MainWindow(QMainWindow):
         redo_action.triggered.connect(self._controller.redo)
         self.addAction(redo_action)
 
-    def _open_pdf(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
+    def _import_drawing(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Drawing", "", "PDF Files (*.pdf)")
         if not path:
             return
-        self._controller.open_pdf(path)
-        self.setWindowTitle(f"QS Automation — {path}")
+        self._controller.dispatch(ImportDrawing(path))
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(sys.argv)
-    window = MainWindow()
+    QImageReader.setAllocationLimit(0)
+    window = LandingWindow()
     window.show()
     sys.exit(app.exec())
