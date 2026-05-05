@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QFileDialog,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
     QDockWidget, QListWidget, QListWidgetItem,
-    QWidget, QVBoxLayout, QPushButton, QLabel,
+    QWidget, QVBoxLayout, QPushButton, QLabel, QMessageBox,
 )
 from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon, QImageReader
 from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal
@@ -34,9 +34,9 @@ class Page:
 
 
 class Drawing:
-    def __init__(self, id: int, filename: str, folder_id: int | None = None):
+    def __init__(self, id: int, name: str, folder_id: int | None = None):
         self.id = id
-        self.filename = filename
+        self.name = name
         self.folder_id = folder_id
         self.pages: list[Page] = []
         self.last_page_index: int = 0
@@ -100,14 +100,11 @@ def bgr_to_qpixmap(arr: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
-def render_page_bytes(path: str, page_index: int) -> bytes:
-    doc = fitz.open(path)
+def render_page_bytes(doc: fitz.Document, page_index: int) -> bytes:
     page = doc[page_index]
     mat = fitz.Matrix(DPI / 72, DPI / 72)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    png_bytes = pix.tobytes("png")
-    doc.close()
-    return png_bytes
+    return pix.tobytes("png")
 
 
 def pixmap_from_bytes(data: bytes) -> QPixmap:
@@ -116,9 +113,8 @@ def pixmap_from_bytes(data: bytes) -> QPixmap:
     return pixmap
 
 
-def insert_drawing(conn: sqlite3.Connection, filename: str) -> int:
-    cursor = conn.execute("INSERT INTO drawings (filename) VALUES (?)", (filename,))
-    conn.commit()
+def insert_drawing(conn: sqlite3.Connection, path: str) -> int:
+    cursor = conn.execute("INSERT INTO drawings (name) VALUES (?)", (os.path.basename(path),))
     return cursor.lastrowid
 
 
@@ -127,8 +123,12 @@ def insert_page(conn: sqlite3.Connection, drawing_id: int, page_number: int, ima
         "INSERT INTO pages (drawing_id, page_number, image) VALUES (?, ?, ?)",
         (drawing_id, page_number, image),
     )
-    conn.commit()
     return cursor.lastrowid
+
+
+def load_page(conn: sqlite3.Connection, page: Page) -> None:
+    (image,) = conn.execute("SELECT image FROM pages WHERE id = ?", (page.id,)).fetchone()
+    page.pixmap = pixmap_from_bytes(image)
 
 
 def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
@@ -166,7 +166,7 @@ def init_db(conn: sqlite3.Connection):
         );
         CREATE TABLE IF NOT EXISTS drawings (
             id INTEGER PRIMARY KEY,
-            filename TEXT NOT NULL,
+            name TEXT NOT NULL,
             last_page INTEGER NOT NULL DEFAULT 0,
             folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
         );
@@ -209,29 +209,59 @@ class AddLegendEntries(Task):
         project.add_legend_entries(self.entries)
 
 
+class LoadProject(Task):
+    def execute(self, project, conn):
+        rows = conn.execute("SELECT id, name, last_page, folder_id FROM drawings").fetchall()
+        for drawing_id, name, last_page, folder_id in rows:
+            drawing = Drawing(id=drawing_id, name=name, folder_id=folder_id)
+            drawing.last_page_index = last_page
+            page_rows = conn.execute(
+                "SELECT id, page_number FROM pages WHERE drawing_id = ? ORDER BY page_number",
+                (drawing_id,),
+            ).fetchall()
+            for page_id, _ in page_rows:
+                drawing.pages.append(Page(id=page_id))
+            project.drawings.append(drawing)
+
+        (last_drawing_id,) = conn.execute("SELECT last_opened_drawing_id FROM project").fetchone()
+        if last_drawing_id is None:
+            return
+
+        active_drawing = next((d for d in project.drawings if d.id == last_drawing_id), None)
+        if active_drawing is None:
+            return
+
+        project.active_drawing = active_drawing
+        for page in active_drawing.pages:
+            load_page(conn, page)
+
+        last_page_index = min(active_drawing.last_page_index, len(active_drawing.pages) - 1)
+        project.active_page = active_drawing.pages[last_page_index]
+
+
 class ImportDrawing(Task):
     def __init__(self, path: str):
         self.path = path
 
     def execute(self, project, conn):
         doc = fitz.open(self.path)
-        page_count = len(doc)
+
+        drawing = None
+        with conn:
+            drawing_id = insert_drawing(conn, self.path)
+            drawing = Drawing(id=drawing_id, name=os.path.basename(self.path))
+            for i in range(len(doc)):
+                image_bytes = render_page_bytes(doc, i)
+                page_id = insert_page(conn, drawing_id, i, image_bytes)
+                drawing.pages.append(Page(id=page_id))
+
         doc.close()
-
-        drawing_id = insert_drawing(conn, self.path)
-        drawing = Drawing(id=drawing_id, filename=self.path)
-
-        for i in range(page_count):
-            image_bytes = render_page_bytes(self.path, i)
-            page_id = insert_page(conn, drawing_id, i, image_bytes)
-            drawing.pages.append(Page(id=page_id))
 
         project.drawings.append(drawing)
         project.active_drawing = drawing
         if drawing.pages:
             first_page = drawing.pages[0]
-            (first_image,) = conn.execute("SELECT image FROM pages WHERE id = ?", (first_page.id,)).fetchone()
-            first_page.pixmap = pixmap_from_bytes(first_image)
+            load_page(conn, first_page)
             project.active_page = first_page
 
 
@@ -548,6 +578,7 @@ class LandingWindow(QMainWindow):
     def _launch(self, conn, path):
         self._main = MainWindow(conn, path)
         self._main.show()
+        self._main._controller.dispatch(LoadProject())
         self.close()
 
 
@@ -604,7 +635,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Import Drawing", "", "PDF Files (*.pdf)")
         if not path:
             return
-        self._controller.dispatch(ImportDrawing(path))
+        try:
+            self._controller.dispatch(ImportDrawing(path))
+        except MemoryError:
+            QMessageBox.critical(self, "Import Failed", "Not enough memory to import this drawing.")
+        except OSError as e:
+            QMessageBox.critical(self, "Import Failed", f"Disk error: {e}")
 
 
 if __name__ == "__main__":
