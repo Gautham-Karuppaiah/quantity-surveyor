@@ -369,6 +369,10 @@ class AppController(QObject):
         self._conn = conn
         self._canvas = None
 
+    @property
+    def project(self) -> Project:
+        return self._project
+
     def set_canvas(self, canvas):
         self._canvas = canvas
 
@@ -407,6 +411,10 @@ class AppController(QObject):
 
     def cancel_tool(self):
         self.set_tool(None)
+
+    def shutdown(self):
+        if self._conn:
+            self._conn.close()
 
     def _on_task_ready(self, task: Task):
         self.dispatch(task)
@@ -533,8 +541,9 @@ class LegendPanel(QDockWidget):
 
 
 class LandingWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, controller: "AppController"):
         super().__init__()
+        self._controller = controller
         self.setWindowTitle("QS Automation")
         self.resize(400, 300)
 
@@ -576,17 +585,18 @@ class LandingWindow(QMainWindow):
         self._launch(conn, path)
 
     def _launch(self, conn, path):
-        self._main = MainWindow(conn, path)
+        self._controller.set_conn(conn)
+        self._main = MainWindow(self._controller, path)
         self._main.show()
-        self._main._controller.dispatch(LoadProject())
+        self._controller.dispatch(LoadProject())
         self.close()
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, conn: sqlite3.Connection, project_path: str):
+    def __init__(self, controller: "AppController", project_path: str):
         super().__init__()
-        self._project = Project()
-        self._controller = AppController(self._project, conn)
+        self._controller = controller
+        self._project = controller.project
 
         self.setWindowTitle(f"QS Automation — {project_path}")
         self.resize(1200, 900)
@@ -647,6 +657,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(sys.argv)
     QImageReader.setAllocationLimit(0)
-    window = LandingWindow()
+    controller = AppController(Project())
+    app.aboutToQuit.connect(controller.shutdown)
+    window = LandingWindow(controller)
     window.show()
     sys.exit(app.exec())
