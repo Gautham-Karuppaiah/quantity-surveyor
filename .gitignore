@@ -6,3 +6,6 @@ __pycache__/
 *.qsproj-wal
 *.tmp
 *.pdf
+prof/
+.benchmarks/
+.pytest_cache/
