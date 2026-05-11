@@ -26,9 +26,8 @@ WHITE_THRESHOLD = 240
 
 
 class Page:
-    def __init__(self, id: int, page_number: int, pixmap: QPixmap | None = None):
+    def __init__(self, id: int, pixmap: QPixmap | None = None):
         self.id = id
-        self.page_number = page_number
         self.pixmap = pixmap
         self.undo_stack = deque(maxlen=100)
         self.redo_stack = deque()
@@ -41,7 +40,6 @@ class Drawing:
         self.folder_id = folder_id
         self.pages: list[Page] = []
         self.last_page_index: int = 0
-        self.pdf: bytes | None = None
 
 
 @dataclass
@@ -102,31 +100,35 @@ def bgr_to_qpixmap(arr: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
-def render_page_pixmap(doc: fitz.Document, page_index: int) -> QPixmap:
+def render_page_bytes(doc: fitz.Document, page_index: int) -> bytes:
     page = doc[page_index]
     mat = fitz.Matrix(DPI / 72, DPI / 72)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    qimg = QImage(pix.samples_ptr, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg)
+    return pix.tobytes("png")
 
 
-def insert_drawing(conn: sqlite3.Connection, path: str, pdf_bytes: bytes) -> int:
-    cursor = conn.execute("INSERT INTO drawings (name, pdf) VALUES (?, ?)", (os.path.basename(path), pdf_bytes))
+def pixmap_from_bytes(data: bytes) -> QPixmap:
+    pixmap = QPixmap()
+    pixmap.loadFromData(data)
+    return pixmap
+
+
+def insert_drawing(conn: sqlite3.Connection, path: str) -> int:
+    cursor = conn.execute("INSERT INTO drawings (name) VALUES (?)", (os.path.basename(path),))
     return cursor.lastrowid
 
 
-def insert_page(conn: sqlite3.Connection, drawing_id: int, page_number: int) -> int:
+def insert_page(conn: sqlite3.Connection, drawing_id: int, page_number: int, image: bytes) -> int:
     cursor = conn.execute(
-        "INSERT INTO pages (drawing_id, page_number) VALUES (?, ?)",
-        (drawing_id, page_number),
+        "INSERT INTO pages (drawing_id, page_number, image) VALUES (?, ?, ?)",
+        (drawing_id, page_number, image),
     )
     return cursor.lastrowid
 
 
-def load_page(drawing: Drawing, page: Page) -> None:
-    doc = fitz.open(stream=drawing.pdf, filetype="pdf")
-    page.pixmap = render_page_pixmap(doc, page.page_number)
-    doc.close()
+def load_page(conn: sqlite3.Connection, page: Page) -> None:
+    (image,) = conn.execute("SELECT image FROM pages WHERE id = ?", (page.id,)).fetchone()
+    page.pixmap = pixmap_from_bytes(image)
 
 
 def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
@@ -166,13 +168,13 @@ def init_db(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             last_page INTEGER NOT NULL DEFAULT 0,
-            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
-            pdf BLOB NOT NULL
+            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS pages (
             id INTEGER PRIMARY KEY,
             drawing_id INTEGER NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
-            page_number INTEGER NOT NULL
+            page_number INTEGER NOT NULL,
+            image BLOB NOT NULL
         );
         CREATE TABLE IF NOT EXISTS legend_entries (
             id INTEGER PRIMARY KEY,
@@ -217,8 +219,8 @@ class LoadProject(Task):
                 "SELECT id, page_number FROM pages WHERE drawing_id = ? ORDER BY page_number",
                 (drawing_id,),
             ).fetchall()
-            for page_id, page_number in page_rows:
-                drawing.pages.append(Page(id=page_id, page_number=page_number))
+            for page_id, _ in page_rows:
+                drawing.pages.append(Page(id=page_id))
             project.drawings.append(drawing)
 
         (last_drawing_id,) = conn.execute("SELECT last_opened_drawing_id FROM project").fetchone()
@@ -229,14 +231,12 @@ class LoadProject(Task):
         if active_drawing is None:
             return
 
-        (pdf_bytes,) = conn.execute("SELECT pdf FROM drawings WHERE id = ?", (last_drawing_id,)).fetchone()
-        active_drawing.pdf = pdf_bytes
-
         project.active_drawing = active_drawing
+        for page in active_drawing.pages:
+            load_page(conn, page)
+
         last_page_index = min(active_drawing.last_page_index, len(active_drawing.pages) - 1)
-        active_page = active_drawing.pages[last_page_index]
-        load_page(active_drawing, active_page)
-        project.active_page = active_page
+        project.active_page = active_drawing.pages[last_page_index]
 
 
 class ImportDrawing(Task):
@@ -244,25 +244,24 @@ class ImportDrawing(Task):
         self.path = path
 
     def execute(self, project, conn):
-        with open(self.path, "rb") as f:
-            pdf_bytes = f.read()
         doc = fitz.open(self.path)
-        page_count = len(doc)
-        doc.close()
 
+        drawing = None
         with conn:
-            drawing_id = insert_drawing(conn, self.path, pdf_bytes)
+            drawing_id = insert_drawing(conn, self.path)
             drawing = Drawing(id=drawing_id, name=os.path.basename(self.path))
-            drawing.pdf = pdf_bytes
-            for i in range(page_count):
-                page_id = insert_page(conn, drawing_id, i)
-                drawing.pages.append(Page(id=page_id, page_number=i))
+            for i in range(len(doc)):
+                image_bytes = render_page_bytes(doc, i)
+                page_id = insert_page(conn, drawing_id, i, image_bytes)
+                drawing.pages.append(Page(id=page_id))
+
+        doc.close()
 
         project.drawings.append(drawing)
         project.active_drawing = drawing
         if drawing.pages:
             first_page = drawing.pages[0]
-            load_page(drawing, first_page)
+            load_page(conn, first_page)
             project.active_page = first_page
 
 
