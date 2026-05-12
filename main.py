@@ -630,6 +630,7 @@ class LandingWindow(QMainWindow):
         if not path:
             return
         if not path.endswith(".qsproj"):
+            os.remove(path)
             path = os.path.splitext(path)[0] + ".qsproj"
         conn = sqlite3.connect(path)
         init_db(conn)
@@ -722,8 +723,8 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(sys.argv)
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
     QImageReader.setAllocationLimit(0)
     controller = AppController(Project())
     app.aboutToQuit.connect(controller.shutdown)
