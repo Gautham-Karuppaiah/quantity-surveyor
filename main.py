@@ -305,44 +305,22 @@ class Project(QObject):
 
 
 
-class Tool(QObject):
-    task_ready = pyqtSignal(object)
-    done = pyqtSignal()
-    cursor: Qt.CursorShape | None = None
-    persistent: bool = False
+class RectGesture:
+    cursor = Qt.CursorShape.CrossCursor
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, on_complete):
+        self._on_complete = on_complete
+        self._anchor: QPointF | None = None
         self._canvas = None
 
     def activate(self, canvas):
         self._canvas = canvas
 
     def deactivate(self):
-        self._canvas = None
-
-    def on_task_emitted(self):
-        if not self.persistent:
-            self.done.emit()
-
-    def on_press(self, pos: QPointF): pass
-    def on_move(self, pos: QPointF): pass
-    def on_release(self, pos: QPointF): pass
-
-
-
-class RectSelectTool(Tool):
-    cursor = Qt.CursorShape.CrossCursor
-
-    def __init__(self):
-        super().__init__()
-        self._anchor: QPointF | None = None
-
-    def deactivate(self):
         self._anchor = None
         if self._canvas:
             self._canvas.clear_preview()
-        super().deactivate()
+        self._canvas = None
 
     def on_press(self, pos: QPointF):
         self._anchor = pos
@@ -358,18 +336,18 @@ class RectSelectTool(Tool):
         rect = QRectF(self._anchor, pos).normalized()
         self._anchor = None
         self._canvas.clear_preview()
-        self.on_complete(rect)
-
-    def on_complete(self, rect: QRectF):
-        pass
+        self._on_complete(rect)
 
 
-class LegendSelectTool(RectSelectTool):
-    def on_complete(self, rect: QRectF):
-        crop = self._canvas.crop(rect)
+# --- tools ---
+
+def start_legend_select(controller):
+    def on_complete(rect):
+        crop = controller.canvas.crop(rect)
         if not crop.isNull():
-            self.task_ready.emit(AddLegendEntries(extract_legend(crop)))
-            self.on_task_emitted()
+            controller.dispatch(AddLegendEntries(extract_legend(crop)))
+        controller.set_tool(None)
+    controller.set_tool(RectGesture(on_complete=on_complete))
 
 
 class AppController(QObject):
@@ -384,17 +362,18 @@ class AppController(QObject):
     def project(self) -> Project:
         return self._project
 
+    @property
+    def canvas(self):
+        return self._canvas
+
     def set_canvas(self, canvas):
         self._canvas = canvas
 
     def set_conn(self, conn: sqlite3.Connection):
         self._conn = conn
 
-    def set_tool(self, tool: Tool | None):
+    def set_tool(self, tool):
         self._canvas.set_tool(tool)
-        if tool:
-            tool.task_ready.connect(self._on_task_ready)
-            tool.done.connect(lambda: self.set_tool(None))
 
     def dispatch(self, task: Task):
         if isinstance(task, Command):
@@ -435,8 +414,6 @@ class AppController(QObject):
             )
             self._conn.commit()
 
-    def _on_task_ready(self, task: Task):
-        self.dispatch(task)
 
 
 class PDFViewer(QGraphicsView):
@@ -449,9 +426,9 @@ class PDFViewer(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self._page_item: QGraphicsPixmapItem | None = None
         self._rect_item: QGraphicsRectItem | None = None
-        self._active_tool: Tool | None = None
+        self._active_tool = None
 
-    def set_tool(self, tool: Tool | None):
+    def set_tool(self, tool):
         if self._active_tool:
             self._active_tool.deactivate()
         self._active_tool = tool
@@ -647,7 +624,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(import_action)
 
         legend_action = QAction("Load Legend", self)
-        legend_action.triggered.connect(lambda: self._controller.set_tool(LegendSelectTool()))
+        legend_action.triggered.connect(lambda: start_legend_select(self._controller))
         toolbar.addAction(legend_action)
 
         undo_action = QAction("Undo", self)
