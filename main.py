@@ -237,6 +237,14 @@ class AddLegendEntries(Task):
         self.entries = entries
 
     def execute(self, project, conn):
+        for entry in self.entries:
+            _, img_buf = cv2.imencode(".png", entry.image)
+            _, mask_buf = cv2.imencode(".png", entry.mask)
+            conn.execute(
+                "INSERT INTO legend_entries (label, image, mask, auto_count) VALUES (?, ?, ?, ?)",
+                (entry.label, img_buf.tobytes(), mask_buf.tobytes(), int(entry.auto_count)),
+            )
+        conn.commit()
         project.add_legend_entries(self.entries)
 
 
@@ -255,6 +263,20 @@ class LoadProject(Task):
             for page_id, _ in page_rows:
                 drawing.pages.append(Page(id=page_id))
             project.drawings.append(drawing)
+
+        legend_rows = conn.execute(
+            "SELECT label, image, mask, auto_count FROM legend_entries"
+        ).fetchall()
+        legend_entries = []
+        for label, img_blob, mask_blob, auto_count in legend_rows:
+            image = cv2.imdecode(np.frombuffer(img_blob, np.uint8), cv2.IMREAD_COLOR)
+            mask = cv2.imdecode(np.frombuffer(mask_blob, np.uint8), cv2.IMREAD_GRAYSCALE)
+            pixmap = bgr_to_qpixmap(image)
+            legend_entries.append(
+                LegendEntry(label=label, image=image, mask=mask, pixmap=pixmap, auto_count=bool(auto_count))
+            )
+        if legend_entries:
+            project.add_legend_entries(legend_entries)
 
         (last_drawing_id,) = conn.execute(
             "SELECT last_opened_drawing_id FROM project"
