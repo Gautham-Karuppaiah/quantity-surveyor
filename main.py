@@ -11,10 +11,22 @@ import numpy as np
 from img2table.document import Image as TableImage
 from img2table.ocr import EasyOCR
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QToolBar, QFileDialog,
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
-    QDockWidget, QListWidget, QListWidgetItem,
-    QWidget, QVBoxLayout, QPushButton, QLabel, QMessageBox,
+    QApplication,
+    QMainWindow,
+    QToolBar,
+    QFileDialog,
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
+    QDockWidget,
+    QListWidget,
+    QListWidgetItem,
+    QWidget,
+    QVBoxLayout,
+    QPushButton,
+    QLabel,
+    QMessageBox,
 )
 from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon, QImageReader
 from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal
@@ -84,7 +96,7 @@ def tight_crop(img: np.ndarray, pad: int = 4) -> np.ndarray:
     rmax = min(h - 1, rmax + pad)
     cmin = max(0, cmin - pad)
     cmax = min(w - 1, cmax + pad)
-    return img[rmin:rmax + 1, cmin:cmax + 1]
+    return img[rmin : rmax + 1, cmin : cmax + 1]
 
 
 def qpixmap_to_bgr(pixmap: QPixmap) -> np.ndarray:
@@ -93,7 +105,12 @@ def qpixmap_to_bgr(pixmap: QPixmap) -> np.ndarray:
     stride = qimg.bytesPerLine()
     ptr = qimg.bits()
     ptr.setsize(h * stride)
-    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, stride))[:, :w * 3].reshape((h, w, 3)).copy()
+    arr = (
+        np.frombuffer(ptr, dtype=np.uint8)
+        .reshape((h, stride))[:, : w * 3]
+        .reshape((h, w, 3))
+        .copy()
+    )
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
@@ -118,11 +135,15 @@ def pixmap_from_bytes(data: bytes) -> QPixmap:
 
 
 def insert_drawing(conn: sqlite3.Connection, path: str) -> int:
-    cursor = conn.execute("INSERT INTO drawings (name) VALUES (?)", (os.path.basename(path),))
+    cursor = conn.execute(
+        "INSERT INTO drawings (name) VALUES (?)", (os.path.basename(path),)
+    )
     return cursor.lastrowid
 
 
-def insert_page(conn: sqlite3.Connection, drawing_id: int, page_number: int, image: bytes) -> int:
+def insert_page(
+    conn: sqlite3.Connection, drawing_id: int, page_number: int, image: bytes
+) -> int:
     cursor = conn.execute(
         "INSERT INTO pages (drawing_id, page_number, image) VALUES (?, ?, ?)",
         (drawing_id, page_number, image),
@@ -131,7 +152,9 @@ def insert_page(conn: sqlite3.Connection, drawing_id: int, page_number: int, ima
 
 
 def load_page(conn: sqlite3.Connection, page: Page) -> None:
-    (image,) = conn.execute("SELECT image FROM pages WHERE id = ?", (page.id,)).fetchone()
+    (image,) = conn.execute(
+        "SELECT image FROM pages WHERE id = ?", (page.id,)
+    ).fetchone()
     page.pixmap = pixmap_from_bytes(image)
 
 
@@ -156,7 +179,9 @@ def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
             clean = tight_crop(remove_border(cell_bgr))
             mask = (clean.min(axis=2) < WHITE_THRESHOLD).astype(np.uint8) * 255
             entry_pixmap = bgr_to_qpixmap(clean)
-            entries.append(LegendEntry(label=label, image=clean, mask=mask, pixmap=entry_pixmap))
+            entries.append(
+                LegendEntry(label=label, image=clean, mask=mask, pixmap=entry_pixmap)
+            )
     return entries
 
 
@@ -198,11 +223,13 @@ def init_db(conn: sqlite3.Connection):
 
 
 class Task:
-    def execute(self, project, conn): raise NotImplementedError
+    def execute(self, project, conn):
+        raise NotImplementedError
 
 
 class Command(Task):
-    def undo(self, project, conn): raise NotImplementedError
+    def undo(self, project, conn):
+        raise NotImplementedError
 
 
 class AddLegendEntries(Task):
@@ -215,7 +242,9 @@ class AddLegendEntries(Task):
 
 class LoadProject(Task):
     def execute(self, project, conn):
-        rows = conn.execute("SELECT id, name, last_page, folder_id FROM drawings").fetchall()
+        rows = conn.execute(
+            "SELECT id, name, last_page, folder_id FROM drawings"
+        ).fetchall()
         for drawing_id, name, last_page, folder_id in rows:
             drawing = Drawing(id=drawing_id, name=name, folder_id=folder_id)
             drawing.last_page_index = last_page
@@ -227,11 +256,15 @@ class LoadProject(Task):
                 drawing.pages.append(Page(id=page_id))
             project.drawings.append(drawing)
 
-        (last_drawing_id,) = conn.execute("SELECT last_opened_drawing_id FROM project").fetchone()
+        (last_drawing_id,) = conn.execute(
+            "SELECT last_opened_drawing_id FROM project"
+        ).fetchone()
         if last_drawing_id is None:
             return
 
-        active_drawing = next((d for d in project.drawings if d.id == last_drawing_id), None)
+        active_drawing = next(
+            (d for d in project.drawings if d.id == last_drawing_id), None
+        )
         if active_drawing is None:
             return
 
@@ -239,7 +272,9 @@ class LoadProject(Task):
         for page in active_drawing.pages:
             load_page(conn, page)
 
-        last_page_index = min(active_drawing.last_page_index, len(active_drawing.pages) - 1)
+        last_page_index = min(
+            active_drawing.last_page_index, len(active_drawing.pages) - 1
+        )
         project.active_page = active_drawing.pages[last_page_index]
 
 
@@ -308,7 +343,6 @@ class Project(QObject):
         self.legend_entries_changed.emit()
 
 
-
 class RectGesture:
     cursor = Qt.CursorShape.CrossCursor
 
@@ -345,12 +379,14 @@ class RectGesture:
 
 # --- tools ---
 
+
 def start_legend_select(controller):
     def on_complete(rect):
         crop = controller.canvas.crop(rect)
         if not crop.isNull():
             controller.dispatch(AddLegendEntries(extract_legend(crop)))
         controller.set_tool(None)
+
     controller.set_tool(RectGesture(on_complete=on_complete))
 
 
@@ -417,7 +453,6 @@ class AppController(QObject):
                 (self._project.active_drawing.id,),
             )
             self._conn.commit()
-
 
 
 class PDFViewer(QGraphicsView):
@@ -567,7 +602,9 @@ class LandingWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def _new_project(self):
-        path, _ = QFileDialog.getSaveFileName(self, "New Project", "", "QS Project (*.qsproj)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "New Project", "", "QS Project (*.qsproj)"
+        )
         if not path:
             return
         if not path.endswith(".qsproj"):
@@ -577,7 +614,9 @@ class LandingWindow(QMainWindow):
         self._launch(conn, path)
 
     def _open_project(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "QS Project (*.qsproj)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project", "", "QS Project (*.qsproj)"
+        )
         if not path:
             return
         conn = sqlite3.connect(path)
@@ -612,8 +651,11 @@ class MainWindow(QMainWindow):
             lambda: self.legend_panel.set_entries(self._project.legend_entries)
         )
         self._project.active_page_changed.connect(
-            lambda: self.viewer.load_pixmap(self._project.active_page.pixmap)
-            if self._project.active_page else None
+            lambda: (
+                self.viewer.load_pixmap(self._project.active_page.pixmap)
+                if self._project.active_page
+                else None
+            )
         )
         self.viewer.escape_pressed.connect(self._controller.cancel_tool)
 
@@ -642,13 +684,17 @@ class MainWindow(QMainWindow):
         self.addAction(redo_action)
 
     def _import_drawing(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import Drawing", "", "PDF Files (*.pdf)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Drawing", "", "PDF Files (*.pdf)"
+        )
         if not path:
             return
         try:
             self._controller.dispatch(ImportDrawing(path))
         except MemoryError:
-            QMessageBox.critical(self, "Import Failed", "Not enough memory to import this drawing.")
+            QMessageBox.critical(
+                self, "Import Failed", "Not enough memory to import this drawing."
+            )
         except OSError as e:
             QMessageBox.critical(self, "Import Failed", f"Disk error: {e}")
 
