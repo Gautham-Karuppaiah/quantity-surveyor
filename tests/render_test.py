@@ -1,7 +1,7 @@
 import sqlite3
 import time
 import fitz
-from main import DPI, render_page_bytes, pixmap_from_bytes
+from main import render_page_bytes, pixmap_from_bytes
 
 
 def test_render_speed(qtbot):

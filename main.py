@@ -57,11 +57,15 @@ def remove_border(img: np.ndarray) -> np.ndarray:
     flood = binary.copy()
     flood_mask = np.zeros((h + 2, w + 2), np.uint8)
     for x in range(w):
-        if flood[0, x] == 255: cv2.floodFill(flood, flood_mask, (x, 0), 128, flags=8)
-        if flood[h - 1, x] == 255: cv2.floodFill(flood, flood_mask, (x, h - 1), 128, flags=8)
+        if flood[0, x] == 255:
+            cv2.floodFill(flood, flood_mask, (x, 0), 128, flags=8)
+        if flood[h - 1, x] == 255:
+            cv2.floodFill(flood, flood_mask, (x, h - 1), 128, flags=8)
     for y in range(h):
-        if flood[y, 0] == 255: cv2.floodFill(flood, flood_mask, (0, y), 128, flags=8)
-        if flood[y, w - 1] == 255: cv2.floodFill(flood, flood_mask, (w - 1, y), 128, flags=8)
+        if flood[y, 0] == 255:
+            cv2.floodFill(flood, flood_mask, (0, y), 128, flags=8)
+        if flood[y, w - 1] == 255:
+            cv2.floodFill(flood, flood_mask, (w - 1, y), 128, flags=8)
     result = img.copy()
     result[flood == 128] = 255
     return result
