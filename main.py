@@ -318,7 +318,7 @@ class ImportDrawing(Task):
 
         doc.close()
 
-        project.drawings.append(drawing)
+        project.add_drawing(drawing)
         project.active_drawing = drawing
         if drawing.pages:
             first_page = drawing.pages[0]
@@ -330,6 +330,7 @@ class Project(QObject):
     legend_entries_changed = pyqtSignal()
     active_page_changed = pyqtSignal()
     active_drawing_changed = pyqtSignal()
+    drawings_changed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -359,6 +360,10 @@ class Project(QObject):
     def active_page(self, page: Page | None):
         self._active_page = page
         self.active_page_changed.emit()
+
+    def add_drawing(self, drawing: Drawing):
+        self.drawings.append(drawing)
+        self.drawings_changed.emit()
 
     def add_legend_entries(self, entries: list[LegendEntry]):
         self._legend_entries.extend(entries)
