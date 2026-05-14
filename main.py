@@ -1,15 +1,15 @@
 import os
 import signal
-import sqlite3
 import sys
 from collections import deque
-from dataclasses import dataclass
 
 import cv2
 import fitz
 import numpy as np
 from img2table.document import Image as TableImage
 from img2table.ocr import EasyOCR
+from sqlalchemy import create_engine, select, func, LargeBinary, ForeignKey, event
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon, QImageReader
-from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal, QTimer
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
@@ -37,30 +37,92 @@ DPI = 200
 WHITE_THRESHOLD = 240
 
 
-class Page:
-    def __init__(self, id: int, pixmap: QPixmap | None = None):
-        self.id = id
-        self.pixmap = pixmap
+class Base(DeclarativeBase):
+    pass
+
+
+class Folder(Base):
+    __tablename__ = "folders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+
+
+class Drawing(Base):
+    __tablename__ = "drawings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    last_page: Mapped[int] = mapped_column(default=0)
+    folder_id: Mapped[int | None] = mapped_column(ForeignKey("folders.id"), nullable=True)
+    pages: Mapped[list["Page"]] = relationship(
+        back_populates="drawing",
+        cascade="all, delete-orphan",
+        order_by="Page.page_number",
+    )
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.last_page_index: int = 0
+
+
+class Page(Base):
+    __tablename__ = "pages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    drawing_id: Mapped[int] = mapped_column(ForeignKey("drawings.id"))
+    page_number: Mapped[int]
+    image_data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+    drawing: Mapped["Drawing"] = relationship(back_populates="pages")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.pixmap: QPixmap | None = None
         self.undo_stack = deque(maxlen=100)
         self.redo_stack = deque()
 
 
-class Drawing:
-    def __init__(self, id: int, name: str, folder_id: int | None = None):
-        self.id = id
-        self.name = name
-        self.folder_id = folder_id
-        self.pages: list[Page] = []
-        self.last_page_index: int = 0
+class LegendEntry(Base):
+    __tablename__ = "legend_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    label: Mapped[str]
+    image_data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+    mask_data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+    auto_count: Mapped[bool] = mapped_column(default=True)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.image: np.ndarray | None = None
+        self.mask: np.ndarray | None = None
+        self.pixmap: QPixmap | None = None
 
 
-@dataclass
-class LegendEntry:
-    label: str
-    image: np.ndarray
-    mask: np.ndarray
-    pixmap: QPixmap
-    auto_count: bool = True
+class ProjectState(Base):
+    __tablename__ = "project"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    last_opened_drawing_id: Mapped[int | None] = mapped_column(
+        ForeignKey("drawings.id"), nullable=True
+    )
+
+
+def _make_engine(path: str):
+    engine = create_engine(f"sqlite:///{path}")
+
+    @event.listens_for(engine, "connect")
+    def set_pragmas(dbapi_conn, _):
+        dbapi_conn.execute("PRAGMA foreign_keys = ON")
+        dbapi_conn.execute("PRAGMA journal_mode = WAL")
+
+    return engine
+
+
+def _init_project_state(engine):
+    with Session(engine) as s:
+        if not s.scalar(select(func.count()).select_from(ProjectState)):
+            s.add(ProjectState())
+            s.commit()
 
 
 def remove_border(img: np.ndarray) -> np.ndarray:
@@ -134,28 +196,9 @@ def pixmap_from_bytes(data: bytes) -> QPixmap:
     return pixmap
 
 
-def insert_drawing(conn: sqlite3.Connection, path: str) -> int:
-    cursor = conn.execute(
-        "INSERT INTO drawings (name) VALUES (?)", (os.path.basename(path),)
-    )
-    return cursor.lastrowid
-
-
-def insert_page(
-    conn: sqlite3.Connection, drawing_id: int, page_number: int, image: bytes
-) -> int:
-    cursor = conn.execute(
-        "INSERT INTO pages (drawing_id, page_number, image) VALUES (?, ?, ?)",
-        (drawing_id, page_number, image),
-    )
-    return cursor.lastrowid
-
-
-def load_page(conn: sqlite3.Connection, page: Page) -> None:
-    (image,) = conn.execute(
-        "SELECT image FROM pages WHERE id = ?", (page.id,)
-    ).fetchone()
-    page.pixmap = pixmap_from_bytes(image)
+def load_page(page: Page, session: Session) -> None:
+    session.refresh(page, ["image_data"])
+    page.pixmap = pixmap_from_bytes(page.image_data)
 
 
 def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
@@ -178,57 +221,21 @@ def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
                 continue
             clean = tight_crop(remove_border(cell_bgr))
             mask = (clean.min(axis=2) < WHITE_THRESHOLD).astype(np.uint8) * 255
-            entry_pixmap = bgr_to_qpixmap(clean)
-            entries.append(
-                LegendEntry(label=label, image=clean, mask=mask, pixmap=entry_pixmap)
-            )
+            entry = LegendEntry(label=label)
+            entry.image = clean
+            entry.mask = mask
+            entry.pixmap = bgr_to_qpixmap(clean)
+            entries.append(entry)
     return entries
 
 
-def init_db(conn: sqlite3.Connection):
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS folders (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS drawings (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            last_page INTEGER NOT NULL DEFAULT 0,
-            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
-        );
-        CREATE TABLE IF NOT EXISTS pages (
-            id INTEGER PRIMARY KEY,
-            drawing_id INTEGER NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
-            page_number INTEGER NOT NULL,
-            image BLOB NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS legend_entries (
-            id INTEGER PRIMARY KEY,
-            label TEXT NOT NULL,
-            image BLOB NOT NULL,
-            mask BLOB NOT NULL,
-            auto_count INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS project (
-            last_opened_drawing_id INTEGER REFERENCES drawings(id)
-        );
-    """)
-    (count,) = conn.execute("SELECT COUNT(*) FROM project").fetchone()
-    if count == 0:
-        conn.execute("INSERT INTO project VALUES (NULL)")
-    conn.commit()
-
-
 class Task:
-    def execute(self, project, conn):
+    def execute(self, project, session):
         raise NotImplementedError
 
 
 class Command(Task):
-    def undo(self, project, conn):
+    def undo(self, project, session):
         raise NotImplementedError
 
 
@@ -236,93 +243,69 @@ class AddLegendEntries(Task):
     def __init__(self, entries: list[LegendEntry]):
         self.entries = entries
 
-    def execute(self, project, conn):
+    def execute(self, project, session):
         for entry in self.entries:
             _, img_buf = cv2.imencode(".png", entry.image)
             _, mask_buf = cv2.imencode(".png", entry.mask)
-            conn.execute(
-                "INSERT INTO legend_entries (label, image, mask, auto_count) VALUES (?, ?, ?, ?)",
-                (entry.label, img_buf.tobytes(), mask_buf.tobytes(), int(entry.auto_count)),
-            )
-        conn.commit()
+            entry.image_data = img_buf.tobytes()
+            entry.mask_data = mask_buf.tobytes()
+            session.add(entry)
         project.add_legend_entries(self.entries)
 
 
 class LoadProject(Task):
-    def execute(self, project, conn):
-        rows = conn.execute(
-            "SELECT id, name, last_page, folder_id FROM drawings"
-        ).fetchall()
-        for drawing_id, name, last_page, folder_id in rows:
-            drawing = Drawing(id=drawing_id, name=name, folder_id=folder_id)
-            drawing.last_page_index = last_page
-            page_rows = conn.execute(
-                "SELECT id, page_number FROM pages WHERE drawing_id = ? ORDER BY page_number",
-                (drawing_id,),
-            ).fetchall()
-            for page_id, _ in page_rows:
-                drawing.pages.append(Page(id=page_id))
-            project.drawings.append(drawing)
+    def execute(self, project, session):
+        drawings = list(session.scalars(select(Drawing)))
+        for drawing in drawings:
+            drawing.last_page_index = drawing.last_page
+            project.add_drawing(drawing)
 
-        legend_rows = conn.execute(
-            "SELECT label, image, mask, auto_count FROM legend_entries"
-        ).fetchall()
-        legend_entries = []
-        for label, img_blob, mask_blob, auto_count in legend_rows:
-            image = cv2.imdecode(np.frombuffer(img_blob, np.uint8), cv2.IMREAD_COLOR)
-            mask = cv2.imdecode(np.frombuffer(mask_blob, np.uint8), cv2.IMREAD_GRAYSCALE)
-            pixmap = bgr_to_qpixmap(image)
-            legend_entries.append(
-                LegendEntry(label=label, image=image, mask=mask, pixmap=pixmap, auto_count=bool(auto_count))
+        legend_entries = list(session.scalars(select(LegendEntry)))
+        for entry in legend_entries:
+            entry.image = cv2.imdecode(
+                np.frombuffer(entry.image_data, np.uint8), cv2.IMREAD_COLOR
             )
+            entry.mask = cv2.imdecode(
+                np.frombuffer(entry.mask_data, np.uint8), cv2.IMREAD_GRAYSCALE
+            )
+            entry.pixmap = bgr_to_qpixmap(entry.image)
         if legend_entries:
             project.add_legend_entries(legend_entries)
 
-        (last_drawing_id,) = conn.execute(
-            "SELECT last_opened_drawing_id FROM project"
-        ).fetchone()
-        if last_drawing_id is None:
+        state = session.scalar(select(ProjectState))
+        if not state or state.last_opened_drawing_id is None:
             return
 
-        active_drawing = next(
-            (d for d in project.drawings if d.id == last_drawing_id), None
-        )
+        active_drawing = session.get(Drawing, state.last_opened_drawing_id)
         if active_drawing is None:
             return
 
         project.active_drawing = active_drawing
-        for page in active_drawing.pages:
-            load_page(conn, page)
-
-        last_page_index = min(
-            active_drawing.last_page_index, len(active_drawing.pages) - 1
-        )
-        project.active_page = active_drawing.pages[last_page_index]
+        last_page_index = min(active_drawing.last_page_index, len(active_drawing.pages) - 1)
+        page = active_drawing.pages[last_page_index]
+        load_page(page, session)
+        project.active_page = page
 
 
 class ImportDrawing(Task):
     def __init__(self, path: str):
         self.path = path
 
-    def execute(self, project, conn):
+    def execute(self, project, session):
         doc = fitz.open(self.path)
-
-        drawing = None
-        with conn:
-            drawing_id = insert_drawing(conn, self.path)
-            drawing = Drawing(id=drawing_id, name=os.path.basename(self.path))
-            for i in range(len(doc)):
-                image_bytes = render_page_bytes(doc, i)
-                page_id = insert_page(conn, drawing_id, i, image_bytes)
-                drawing.pages.append(Page(id=page_id))
-
+        drawing = Drawing(name=os.path.basename(self.path))
+        session.add(drawing)
+        for i in range(len(doc)):
+            page = Page(page_number=i, image_data=render_page_bytes(doc, i))
+            drawing.pages.append(page)
+        session.flush()
         doc.close()
 
         project.add_drawing(drawing)
         project.active_drawing = drawing
         if drawing.pages:
             first_page = drawing.pages[0]
-            load_page(conn, first_page)
+            load_page(first_page, session)
             project.active_page = first_page
 
 
@@ -404,9 +387,6 @@ class RectGesture:
         self._on_complete(rect)
 
 
-# --- tools ---
-
-
 def start_legend_select(controller):
     def on_complete(rect):
         crop = controller.canvas.crop(rect)
@@ -418,11 +398,15 @@ def start_legend_select(controller):
 
 
 class AppController(QObject):
-    def __init__(self, project: Project, conn: sqlite3.Connection | None = None):
+    def __init__(self, project: Project, session: Session | None = None):
         super().__init__()
         self._project = project
-        self._conn = conn
+        self._session = session
         self._canvas = None
+        self._autosave_timer = QTimer()
+        self._autosave_timer.setInterval(30_000)
+        self._autosave_timer.timeout.connect(self._autosave)
+        self._autosave_timer.start()
         project.active_drawing_changed.connect(self._on_active_drawing_changed)
 
     @property
@@ -436,8 +420,8 @@ class AppController(QObject):
     def set_canvas(self, canvas):
         self._canvas = canvas
 
-    def set_conn(self, conn: sqlite3.Connection):
-        self._conn = conn
+    def set_session(self, session: Session):
+        self._session = session
 
     def set_tool(self, tool):
         self._canvas.set_tool(tool)
@@ -445,41 +429,45 @@ class AppController(QObject):
     def dispatch(self, task: Task):
         if isinstance(task, Command):
             page = self._project.active_page
-            task.execute(self._project, self._conn)
+            task.execute(self._project, self._session)
             if page:
                 page.undo_stack.append(task)
                 page.redo_stack.clear()
         else:
-            task.execute(self._project, self._conn)
+            task.execute(self._project, self._session)
 
     def undo(self):
         page = self._project.active_page
         if page and page.undo_stack:
             cmd = page.undo_stack.pop()
-            cmd.undo(self._project, self._conn)
+            cmd.undo(self._project, self._session)
             page.redo_stack.append(cmd)
 
     def redo(self):
         page = self._project.active_page
         if page and page.redo_stack:
             cmd = page.redo_stack.pop()
-            cmd.execute(self._project, self._conn)
+            cmd.execute(self._project, self._session)
             page.undo_stack.append(cmd)
 
     def cancel_tool(self):
         self.set_tool(None)
 
     def shutdown(self):
-        if self._conn:
-            self._conn.close()
+        if self._session:
+            self._session.commit()
+            self._session.close()
+
+    def _autosave(self):
+        if self._session:
+            self._session.commit()
 
     def _on_active_drawing_changed(self):
-        if self._conn and self._project.active_drawing:
-            self._conn.execute(
-                "UPDATE project SET last_opened_drawing_id = ?",
-                (self._project.active_drawing.id,),
-            )
-            self._conn.commit()
+        if not self._session or not self._project.active_drawing:
+            return
+        state = self._session.scalar(select(ProjectState))
+        if state:
+            state.last_opened_drawing_id = self._project.active_drawing.id
 
 
 class PDFViewer(QGraphicsView):
@@ -637,9 +625,10 @@ class LandingWindow(QMainWindow):
         if not path.endswith(".qsproj"):
             os.remove(path)
             path = os.path.splitext(path)[0] + ".qsproj"
-        conn = sqlite3.connect(path)
-        init_db(conn)
-        self._launch(conn, path)
+        engine = _make_engine(path)
+        Base.metadata.create_all(engine)
+        _init_project_state(engine)
+        self._launch(Session(engine), path)
 
     def _open_project(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -647,12 +636,13 @@ class LandingWindow(QMainWindow):
         )
         if not path:
             return
-        conn = sqlite3.connect(path)
-        init_db(conn)
-        self._launch(conn, path)
+        engine = _make_engine(path)
+        Base.metadata.create_all(engine)
+        _init_project_state(engine)
+        self._launch(Session(engine), path)
 
-    def _launch(self, conn, path):
-        self._controller.set_conn(conn)
+    def _launch(self, session, path):
+        self._controller.set_session(session)
         self._main = MainWindow(self._controller, path)
         self._main.show()
         self._controller.dispatch(LoadProject())
