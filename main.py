@@ -9,7 +9,7 @@ import numpy as np
 from img2table.document import Image as TableImage
 from img2table.ocr import EasyOCR
 from sqlalchemy import create_engine, select, func, LargeBinary, ForeignKey, event
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session, make_transient
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -74,6 +74,9 @@ class Page(Base):
     page_number: Mapped[int]
     image_data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
     drawing: Mapped["Drawing"] = relationship(back_populates="pages")
+    markers: Mapped[list["Marker"]] = relationship(
+        back_populates="page", cascade="all, delete-orphan"
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -90,12 +93,30 @@ class LegendEntry(Base):
     image_data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
     mask_data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
     auto_count: Mapped[bool] = mapped_column(default=True)
+    markers: Mapped[list["Marker"]] = relationship(
+        back_populates="legend_entry", cascade="all"
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.image: np.ndarray | None = None
         self.mask: np.ndarray | None = None
         self.pixmap: QPixmap | None = None
+
+
+class Marker(Base):
+    __tablename__ = "markers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    legend_entry_id: Mapped[int] = mapped_column(ForeignKey("legend_entries.id"))
+    page_id: Mapped[int] = mapped_column(ForeignKey("pages.id"))
+    x: Mapped[int]
+    y: Mapped[int]
+    w: Mapped[int]
+    h: Mapped[int]
+    score: Mapped[float | None] = mapped_column(nullable=True)
+    page: Mapped["Page"] = relationship(back_populates="markers")
+    legend_entry: Mapped["LegendEntry"] = relationship(back_populates="markers")
 
 
 class ProjectState(Base):
@@ -314,6 +335,7 @@ class Project(QObject):
     active_page_changed = pyqtSignal()
     active_drawing_changed = pyqtSignal()
     drawings_changed = pyqtSignal()
+    markers_changed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -351,6 +373,9 @@ class Project(QObject):
     def add_legend_entries(self, entries: list[LegendEntry]):
         self._legend_entries.extend(entries)
         self.legend_entries_changed.emit()
+
+    def notify_markers_changed(self):
+        self.markers_changed.emit()
 
 
 class RectGesture:
@@ -395,6 +420,101 @@ def start_legend_select(controller):
         controller.set_tool(None)
 
     controller.set_tool(RectGesture(on_complete=on_complete))
+
+
+def _entry_color(legend_entry_id: int) -> QColor:
+    hue = (legend_entry_id * 0.618033988749895) % 1.0
+    return QColor.fromHsvF(hue, 0.9, 0.85)
+
+
+class AddMarker(Command):
+    def __init__(self, entry: LegendEntry, page: Page, x: int, y: int, w: int, h: int):
+        self._entry = entry
+        self._page = page
+        self._marker = Marker(
+            legend_entry_id=entry.id, page_id=page.id, x=x, y=y, w=w, h=h
+        )
+
+    def execute(self, project, session):
+        self._page.markers.append(self._marker)
+        session.add(self._marker)
+        session.flush()
+        project.notify_markers_changed()
+
+    def undo(self, project, session):
+        self._page.markers.remove(self._marker)
+        session.delete(self._marker)
+        project.notify_markers_changed()
+
+
+class DeleteMarker(Command):
+    def __init__(self, marker: Marker, page: Page):
+        self._marker = marker
+        self._page = page
+
+    def execute(self, project, session):
+        self._page.markers.remove(self._marker)
+        session.delete(self._marker)
+        project.notify_markers_changed()
+
+    def undo(self, project, session):
+        make_transient(self._marker)
+        self._marker.id = None
+        self._page.markers.append(self._marker)
+        session.add(self._marker)
+        session.flush()
+        project.notify_markers_changed()
+
+
+class PointGesture:
+    cursor = Qt.CursorShape.CrossCursor
+    is_started = False
+
+    def __init__(self, on_click):
+        self._on_click = on_click
+
+    def activate(self, canvas):
+        pass
+
+    def deactivate(self):
+        pass
+
+    def on_press(self, pos: QPointF):
+        self._on_click(pos)
+
+    def on_move(self, pos: QPointF):
+        pass
+
+    def on_release(self, pos: QPointF):
+        pass
+
+
+def start_add_marker(controller, entry: LegendEntry):
+    def on_click(pos: QPointF):
+        page = controller.project.active_page
+        if page is None:
+            return
+        th, tw = entry.image.shape[:2]
+        x = round(pos.x() - tw / 2)
+        y = round(pos.y() - th / 2)
+        controller.dispatch(AddMarker(entry, page, x, y, tw, th))
+
+    controller.set_tool(PointGesture(on_click))
+
+
+def start_delete_marker(controller):
+    def on_click(pos: QPointF):
+        page = controller.project.active_page
+        if page is None:
+            return
+        marker_id = controller.canvas.marker_id_at(pos)
+        if marker_id is None:
+            return
+        marker = next((m for m in page.markers if m.id == marker_id), None)
+        if marker:
+            controller.dispatch(DeleteMarker(marker, page))
+
+    controller.set_tool(PointGesture(on_click))
 
 
 class AppController(QObject):
@@ -480,6 +600,7 @@ class PDFViewer(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self._page_item: QGraphicsPixmapItem | None = None
         self._rect_item: QGraphicsRectItem | None = None
+        self._overlay_items: list[QGraphicsRectItem] = []
         self._active_tool = None
 
     def set_tool(self, tool):
@@ -497,12 +618,42 @@ class PDFViewer(QGraphicsView):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             self.unsetCursor()
 
+    def show_page(self, page):
+        self.load_pixmap(page.pixmap)
+        self.set_markers(page.markers)
+
     def load_pixmap(self, pixmap: QPixmap):
         self._scene.clear()
         self._rect_item = None
+        self._overlay_items = []
         self._page_item = QGraphicsPixmapItem(pixmap)
         self._scene.addItem(self._page_item)
         self.fitInView(self._page_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_markers(self, markers: list):
+        for item in self._overlay_items:
+            self._scene.removeItem(item)
+        self._overlay_items = []
+        for marker in markers:
+            color = _entry_color(marker.legend_entry_id)
+            pen = QPen(color)
+            pen.setWidth(3)
+            pen.setCosmetic(True)
+            fill = QColor(color)
+            fill.setAlpha(40)
+            item = QGraphicsRectItem(QRectF(marker.x, marker.y, marker.w, marker.h))
+            item.setPen(pen)
+            item.setBrush(fill)
+            item.setData(0, marker.id)
+            self._scene.addItem(item)
+            self._overlay_items.append(item)
+
+    def marker_id_at(self, pos: QPointF) -> int | None:
+        for item in self._scene.items(pos):
+            marker_id = item.data(0)
+            if marker_id is not None:
+                return marker_id
+        return None
 
     def crop(self, rect: QRectF) -> QPixmap:
         if self._page_item is None:
@@ -584,10 +735,17 @@ class LegendPanel(QDockWidget):
         self.setWidget(self._list)
 
     def set_entries(self, entries: list[LegendEntry]):
+        self._entries = entries
         self._list.clear()
         for entry in entries:
             item = QListWidgetItem(QIcon(entry.pixmap), entry.label)
             self._list.addItem(item)
+
+    def selected_entry(self) -> LegendEntry | None:
+        row = self._list.currentRow()
+        if row < 0 or not hasattr(self, "_entries"):
+            return None
+        return self._entries[row]
 
 
 class LandingWindow(QMainWindow):
@@ -668,11 +826,10 @@ class MainWindow(QMainWindow):
         self._project.legend_entries_changed.connect(
             lambda: self.legend_panel.set_entries(self._project.legend_entries)
         )
-        self._project.active_page_changed.connect(
-            lambda: (
-                self.viewer.load_pixmap(self._project.active_page.pixmap)
-                if self._project.active_page
-                else None
+        self._project.active_page_changed.connect(self._on_active_page_changed)
+        self._project.markers_changed.connect(
+            lambda: self.viewer.set_markers(
+                self._project.active_page.markers if self._project.active_page else []
             )
         )
         self.viewer.escape_pressed.connect(self._controller.cancel_tool)
@@ -691,6 +848,16 @@ class MainWindow(QMainWindow):
         legend_action.triggered.connect(lambda: start_legend_select(self._controller))
         toolbar.addAction(legend_action)
 
+        add_marker_action = QAction("Add Marker", self)
+        add_marker_action.triggered.connect(self._add_marker_mode)
+        toolbar.addAction(add_marker_action)
+
+        delete_marker_action = QAction("Delete Marker", self)
+        delete_marker_action.triggered.connect(
+            lambda: start_delete_marker(self._controller)
+        )
+        toolbar.addAction(delete_marker_action)
+
         undo_action = QAction("Undo", self)
         undo_action.setShortcut("Ctrl+Z")
         undo_action.triggered.connect(self._controller.undo)
@@ -700,6 +867,18 @@ class MainWindow(QMainWindow):
         redo_action.setShortcut("Ctrl+Y")
         redo_action.triggered.connect(self._controller.redo)
         self.addAction(redo_action)
+
+    def _on_active_page_changed(self):
+        page = self._project.active_page
+        if page:
+            self.viewer.show_page(page)
+
+    def _add_marker_mode(self):
+        entry = self.legend_panel.selected_entry()
+        if entry is None:
+            QMessageBox.information(self, "No Selection", "Select a legend entry first.")
+            return
+        start_add_marker(self._controller, entry)
 
     def _import_drawing(self):
         path, _ = QFileDialog.getOpenFileName(
