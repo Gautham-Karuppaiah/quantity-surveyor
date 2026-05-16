@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import sys
@@ -19,9 +20,15 @@ from PyQt6.QtWidgets import (
     QGraphicsScene,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
+    QGraphicsPolygonItem,
+    QGraphicsPathItem,
+    QGraphicsTextItem,
     QDockWidget,
     QListWidget,
     QListWidgetItem,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
     QWidget,
     QVBoxLayout,
     QPushButton,
@@ -30,7 +37,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QInputDialog,
 )
-from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon, QImageReader
+from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon, QImageReader, QPolygonF, QPainterPath
 from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal, QTimer, QThread
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
@@ -77,6 +84,9 @@ class Page(Base):
     image_data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
     drawing: Mapped["Drawing"] = relationship(back_populates="pages")
     markers: Mapped[list["Marker"]] = relationship(
+        back_populates="page", cascade="all, delete-orphan"
+    )
+    zones: Mapped[list["Zone"]] = relationship(
         back_populates="page", cascade="all, delete-orphan"
     )
 
@@ -149,6 +159,24 @@ class ProjectState(Base):
     last_opened_drawing_id: Mapped[int | None] = mapped_column(
         ForeignKey("drawings.id"), nullable=True
     )
+
+
+class Zone(Base):
+    __tablename__ = "zones"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    page_id: Mapped[int] = mapped_column(ForeignKey("pages.id"))
+    name: Mapped[str]
+    geometry: Mapped[str]
+    page: Mapped["Page"] = relationship(back_populates="zones")
+
+    @property
+    def points(self) -> list:
+        return json.loads(self.geometry)
+
+    @points.setter
+    def points(self, value: list):
+        self.geometry = json.dumps(value)
 
 
 def _make_engine(path: str):
@@ -251,6 +279,7 @@ def pixmap_from_bytes(data: bytes) -> QPixmap:
 def load_page(page: Page, session: Session) -> None:
     session.refresh(page, ["image_data"])
     page.pixmap = pixmap_from_bytes(page.image_data)
+    _ = page.zones  # eagerly load zones into the session identity map
 
 
 def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
@@ -435,6 +464,7 @@ class Project(QObject):
     active_drawing_changed = pyqtSignal()
     drawings_changed = pyqtSignal()
     markers_changed = pyqtSignal()
+    zones_changed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -478,6 +508,9 @@ class Project(QObject):
 
     def notify_markers_changed(self):
         self.markers_changed.emit()
+
+    def notify_zones_changed(self):
+        self.zones_changed.emit()
 
 
 class RectGesture:
@@ -566,6 +599,139 @@ class DeleteMarker(Command):
         session.add(self._marker)
         session.flush()
         project.notify_markers_changed()
+
+
+class AddZone(Command):
+    def __init__(self, page: Page, name: str, points: list):
+        self._page = page
+        self._zone = Zone(page_id=page.id, name=name, geometry=json.dumps(points))
+
+    def execute(self, project, session):
+        self._page.zones.append(self._zone)
+        session.add(self._zone)
+        session.flush()
+        project.notify_zones_changed()
+
+    def undo(self, project, session):
+        self._page.zones.remove(self._zone)
+        session.delete(self._zone)
+        project.notify_zones_changed()
+
+
+class DeleteZone(Command):
+    def __init__(self, zone: Zone, page: Page):
+        self._zone = zone
+        self._page = page
+
+    def execute(self, project, session):
+        self._page.zones.remove(self._zone)
+        session.delete(self._zone)
+        project.notify_zones_changed()
+
+    def undo(self, project, session):
+        make_transient(self._zone)
+        self._zone.id = None
+        self._page.zones.append(self._zone)
+        session.add(self._zone)
+        session.flush()
+        project.notify_zones_changed()
+
+
+class PolygonGesture:
+    cursor = Qt.CursorShape.CrossCursor
+
+    def __init__(self, on_complete):
+        self._on_complete = on_complete
+        self._points: list[QPointF] = []
+        self._canvas = None
+
+    @property
+    def is_started(self):
+        return len(self._points) > 0
+
+    def activate(self, canvas):
+        self._canvas = canvas
+        self._points = []
+
+    def deactivate(self):
+        if self._canvas:
+            self._canvas.clear_polygon_preview()
+        self._canvas = None
+
+    def on_press(self, pos: QPointF):
+        self._points.append(pos)
+        self._canvas.update_polygon_preview(self._points, pos)
+
+    def on_move(self, pos: QPointF):
+        if self._points:
+            self._canvas.update_polygon_preview(self._points, pos)
+
+    def on_release(self, pos: QPointF):
+        pass
+
+    def on_double_click(self, pos: QPointF):
+        if self._points:
+            self._points.pop()  # remove duplicate from preceding press event
+        if len(self._points) >= 3:
+            self._canvas.clear_polygon_preview()
+            self._on_complete([[p.x(), p.y()] for p in self._points])
+
+    def on_key_return(self):
+        if len(self._points) >= 3:
+            self._canvas.clear_polygon_preview()
+            self._on_complete([[p.x(), p.y()] for p in self._points])
+
+
+def _prompt_zone_name(parent) -> str | None:
+    name, ok = QInputDialog.getText(parent, "Zone Name", "Name:")
+    return name.strip() if ok and name.strip() else None
+
+
+def start_draw_zone_polygon(controller, parent):
+    def on_complete(points):
+        page = controller.project.active_page
+        if not page:
+            return
+        name = _prompt_zone_name(parent)
+        if name:
+            controller.dispatch(AddZone(page, name, points))
+        controller.set_tool(None)
+
+    controller.set_tool(PolygonGesture(on_complete=on_complete))
+
+
+def start_draw_zone_rect(controller, parent):
+    def on_complete(rect: QRectF):
+        page = controller.project.active_page
+        if not page:
+            return
+        name = _prompt_zone_name(parent)
+        if name:
+            points = [
+                [rect.left(), rect.top()],
+                [rect.right(), rect.top()],
+                [rect.right(), rect.bottom()],
+                [rect.left(), rect.bottom()],
+            ]
+            controller.dispatch(AddZone(page, name, points))
+        controller.set_tool(None)
+
+    controller.set_tool(RectGesture(on_complete=on_complete))
+
+
+def start_delete_zone(controller):
+    def on_click(pos: QPointF):
+        page = controller.project.active_page
+        if not page:
+            return
+        zone_id = controller.canvas.zone_id_at(pos)
+        if zone_id is None:
+            return
+        zone = next((z for z in page.zones if z.id == zone_id), None)
+        if zone:
+            controller.dispatch(DeleteZone(zone, page))
+
+    controller.set_tool(PointGesture(on_click))
 
 
 class CountSymbolsWorker(QObject):
@@ -944,6 +1110,9 @@ class PDFViewer(QGraphicsView):
         self._page_item: QGraphicsPixmapItem | None = None
         self._rect_item: QGraphicsRectItem | None = None
         self._overlay_items: list[QGraphicsRectItem] = []
+        self._zone_items: list = []
+        self._poly_preview_items: list = []
+        self._pan_origin = None
         self._active_tool = None
 
     def set_tool(self, tool):
@@ -964,11 +1133,14 @@ class PDFViewer(QGraphicsView):
     def show_page(self, page):
         self.load_pixmap(page.pixmap)
         self.set_markers(page.markers)
+        self.set_zones(page.zones)
 
     def load_pixmap(self, pixmap: QPixmap):
         self._scene.clear()
         self._rect_item = None
         self._overlay_items = []
+        self._zone_items = []
+        self._poly_preview_items = []
         self._page_item = QGraphicsPixmapItem(pixmap)
         self._scene.addItem(self._page_item)
         self.fitInView(self._page_item, Qt.AspectRatioMode.KeepAspectRatio)
@@ -990,6 +1162,69 @@ class PDFViewer(QGraphicsView):
             item.setData(0, marker.id)
             self._scene.addItem(item)
             self._overlay_items.append(item)
+
+    def set_zones(self, zones: list):
+        for item in self._zone_items:
+            self._scene.removeItem(item)
+        self._zone_items = []
+        color = QColor(80, 200, 120)
+        pen = QPen(color)
+        pen.setWidth(3)
+        pen.setCosmetic(True)
+        fill = QColor(color)
+        fill.setAlpha(25)
+        for zone in zones:
+            poly = QPolygonF([QPointF(p[0], p[1]) for p in zone.points])
+            item = QGraphicsPolygonItem(poly)
+            item.setPen(pen)
+            item.setBrush(fill)
+            item.setData(0, zone.id)
+            self._scene.addItem(item)
+            self._zone_items.append(item)
+            cx = sum(p[0] for p in zone.points) / len(zone.points)
+            cy = sum(p[1] for p in zone.points) / len(zone.points)
+            label = QGraphicsTextItem(zone.name)
+            label.setDefaultTextColor(color)
+            label.setPos(cx, cy)
+            self._scene.addItem(label)
+            self._zone_items.append(label)
+
+    def zone_id_at(self, pos: QPointF) -> int | None:
+        for item in self._scene.items(pos):
+            zone_id = item.data(0)
+            if zone_id is not None:
+                return zone_id
+        return None
+
+    def update_polygon_preview(self, points: list[QPointF], cursor: QPointF):
+        for item in self._poly_preview_items:
+            self._scene.removeItem(item)
+        self._poly_preview_items = []
+        pen = QPen(QColor(255, 160, 0))
+        pen.setWidth(2)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        for i in range(len(points) - 1):
+            path = QPainterPath()
+            path.moveTo(points[i])
+            path.lineTo(points[i + 1])
+            item = QGraphicsPathItem(path)
+            item.setPen(pen)
+            self._scene.addItem(item)
+            self._poly_preview_items.append(item)
+        if points:
+            path = QPainterPath()
+            path.moveTo(points[-1])
+            path.lineTo(cursor)
+            item = QGraphicsPathItem(path)
+            item.setPen(pen)
+            self._scene.addItem(item)
+            self._poly_preview_items.append(item)
+
+    def clear_polygon_preview(self):
+        for item in self._poly_preview_items:
+            self._scene.removeItem(item)
+        self._poly_preview_items = []
 
     def marker_id_at(self, pos: QPointF) -> int | None:
         for item in self._scene.items(pos):
@@ -1026,21 +1261,49 @@ class PDFViewer(QGraphicsView):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.escape_pressed.emit()
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._active_tool and hasattr(self._active_tool, "on_key_return"):
+                self._active_tool.on_key_return()
         else:
             super().keyPressEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._active_tool:
+            if hasattr(self._active_tool, "on_double_click"):
+                self._active_tool.on_double_click(self.mapToScene(event.pos()))
+        else:
+            super().mouseDoubleClickEvent(event)
+
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if not (self._active_tool and self._active_tool.is_started):
+                self._pan_origin = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._active_tool:
             self._active_tool.on_press(self.mapToScene(event.pos()))
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._pan_origin is not None:
+            delta = event.pos() - self._pan_origin
+            self._pan_origin = event.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            return
         if self._active_tool:
             self._active_tool.on_move(self.mapToScene(event.pos()))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton and self._pan_origin is not None:
+            self._pan_origin = None
+            if self._active_tool and self._active_tool.cursor is not None:
+                self.setCursor(self._active_tool.cursor)
+            else:
+                self.unsetCursor()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._active_tool:
             self._active_tool.on_release(self.mapToScene(event.pos()))
         else:
@@ -1089,6 +1352,56 @@ class LegendPanel(QDockWidget):
         if row < 0 or not hasattr(self, "_entries"):
             return None
         return self._entries[row]
+
+
+def _zone_counts(page, entries: list) -> dict:
+    if not page or not page.zones or not page.markers:
+        return {}
+    contours = {
+        zone.id: np.array(zone.points, dtype=np.float32).reshape(-1, 1, 2)
+        for zone in page.zones
+    }
+    counts = {}
+    for marker in page.markers:
+        cx = marker.x + marker.w / 2
+        cy = marker.y + marker.h / 2
+        for zone in page.zones:
+            key = (zone.id, marker.legend_entry_id)
+            counts.setdefault(key, 0)
+            if cv2.pointPolygonTest(contours[zone.id], (cx, cy), False) >= 0:
+                counts[key] += 1
+    return counts
+
+
+class ZoneCountsPanel(QDockWidget):
+    def __init__(self, controller: "AppController"):
+        super().__init__("Zone Counts")
+        self._project = controller.project
+        self._table = QTableWidget()
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.setWidget(self._table)
+        self._project.active_page_changed.connect(self._rebuild)
+        self._project.markers_changed.connect(self._rebuild)
+        self._project.zones_changed.connect(self._rebuild)
+        self._project.legend_entries_changed.connect(self._rebuild)
+
+    def _rebuild(self):
+        page = self._project.active_page
+        entries = self._project.legend_entries
+        zones = page.zones if page else []
+        self._table.clear()
+        self._table.setRowCount(len(zones))
+        self._table.setColumnCount(len(entries))
+        self._table.setHorizontalHeaderLabels([e.label for e in entries])
+        self._table.setVerticalHeaderLabels([z.name for z in zones])
+        if not zones or not entries or not page:
+            return
+        counts = _zone_counts(page, entries)
+        for r, zone in enumerate(zones):
+            for c, entry in enumerate(entries):
+                val = counts.get((zone.id, entry.id), 0)
+                self._table.setItem(r, c, QTableWidgetItem(str(val)))
 
 
 class LandingWindow(QMainWindow):
@@ -1166,6 +1479,9 @@ class MainWindow(QMainWindow):
         self.legend_panel = LegendPanel()
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.legend_panel)
 
+        self.zone_counts_panel = ZoneCountsPanel(controller)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.zone_counts_panel)
+
         self._project.legend_entries_changed.connect(
             lambda: self.legend_panel.set_entries(self._project.legend_entries)
         )
@@ -1173,6 +1489,11 @@ class MainWindow(QMainWindow):
         self._project.markers_changed.connect(
             lambda: self.viewer.set_markers(
                 self._project.active_page.markers if self._project.active_page else []
+            )
+        )
+        self._project.zones_changed.connect(
+            lambda: self.viewer.set_zones(
+                self._project.active_page.zones if self._project.active_page else []
             )
         )
         self.viewer.escape_pressed.connect(self._controller.cancel_tool)
@@ -1187,6 +1508,7 @@ class MainWindow(QMainWindow):
 
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self.legend_panel.toggleViewAction())
+        view_menu.addAction(self.zone_counts_panel.toggleViewAction())
 
         self._toolbar = QToolBar()
         self.addToolBar(self._toolbar)
@@ -1218,6 +1540,20 @@ class MainWindow(QMainWindow):
         delete_marker_action = QAction("Delete Marker", self)
         delete_marker_action.triggered.connect(lambda: start_delete_marker(self._controller))
         self._toolbar.addAction(delete_marker_action)
+
+        self._toolbar.addSeparator()
+
+        draw_zone_poly_action = QAction("Draw Zone (Polygon)", self)
+        draw_zone_poly_action.triggered.connect(lambda: start_draw_zone_polygon(self._controller, self))
+        self._toolbar.addAction(draw_zone_poly_action)
+
+        draw_zone_rect_action = QAction("Draw Zone (Rect)", self)
+        draw_zone_rect_action.triggered.connect(lambda: start_draw_zone_rect(self._controller, self))
+        self._toolbar.addAction(draw_zone_rect_action)
+
+        delete_zone_action = QAction("Delete Zone", self)
+        delete_zone_action.triggered.connect(lambda: start_delete_zone(self._controller))
+        self._toolbar.addAction(delete_zone_action)
 
         undo_action = QAction("Undo", self)
         undo_action.setShortcut("Ctrl+Z")
