@@ -10,7 +10,14 @@ import numpy as np
 from img2table.document import Image as TableImage
 from img2table.ocr import EasyOCR
 from sqlalchemy import create_engine, select, func, LargeBinary, ForeignKey, event
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session, make_transient
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+    Session,
+    make_transient,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -37,8 +44,27 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QInputDialog,
 )
-from PyQt6.QtGui import QAction, QPixmap, QImage, QPen, QColor, QIcon, QImageReader, QPolygonF, QPainterPath
-from PyQt6.QtCore import Qt, QRectF, QSize, QObject, QPointF, pyqtSignal, QTimer, QThread
+from PyQt6.QtGui import (
+    QAction,
+    QPixmap,
+    QImage,
+    QPen,
+    QColor,
+    QIcon,
+    QImageReader,
+    QPolygonF,
+    QPainterPath,
+)
+from PyQt6.QtCore import (
+    Qt,
+    QRectF,
+    QSize,
+    QObject,
+    QPointF,
+    pyqtSignal,
+    QTimer,
+    QThread,
+)
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
@@ -63,7 +89,9 @@ class Drawing(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str]
     last_page: Mapped[int] = mapped_column(default=0)
-    folder_id: Mapped[int | None] = mapped_column(ForeignKey("folders.id"), nullable=True)
+    folder_id: Mapped[int | None] = mapped_column(
+        ForeignKey("folders.id"), nullable=True
+    )
     pages: Mapped[list["Page"]] = relationship(
         back_populates="drawing",
         cascade="all, delete-orphan",
@@ -426,7 +454,9 @@ class LoadProject(Task):
             return
 
         project.active_drawing = active_drawing
-        last_page_index = min(active_drawing.last_page_index, len(active_drawing.pages) - 1)
+        last_page_index = min(
+            active_drawing.last_page_index, len(active_drawing.pages) - 1
+        )
         page = active_drawing.pages[last_page_index]
         load_page(page, session)
         project.active_page = page
@@ -734,48 +764,29 @@ def start_delete_zone(controller):
     controller.set_tool(PointGesture(on_click))
 
 
-class CountSymbolsWorker(QObject):
-    results = pyqtSignal(int, list)  # entry_id, list of (x1,y1,x2,y2,score)
+class TaskWorker(QObject):
     finished = pyqtSignal()
+    error = pyqtSignal(str)
     progress = pyqtSignal(int, int)
 
-    THRESHOLD = 0.6
-    COLOR_SAT_MIN = 30
-    HUE_TOLERANCE = 12
-    MIN_BLOB_AREA = 16
-
-    def __init__(self, entries: list, page_bgr: np.ndarray):
+    def __init__(self, task, project, engine):
         super().__init__()
-        self._entries = entries
-        self._page_bgr = page_bgr
+        self._task = task
+        self._project = project
+        self._engine = engine
 
     def run(self):
-        ph, pw = self._page_bgr.shape[:2]
-        total = len(self._entries)
-        for i, entry in enumerate(self._entries):
-            patches = self._color_patches(entry.samples, self._page_bgr, pw, ph)
-            all_boxes = []
-            for sample in entry.samples:
-                rotations = [sample.image] + [
-                    cv2.rotate(sample.image, f)
-                    for f in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                ]
-                for rot in rotations:
-                    rh, rw = rot.shape[:2]
-                    for px, py, patch in patches:
-                        if patch.shape[0] < rh or patch.shape[1] < rw:
-                            continue
-                        result = cv2.matchTemplate(patch, rot, cv2.TM_CCOEFF_NORMED)
-                        _, result_bin = cv2.threshold(result, self.THRESHOLD, 255, cv2.THRESH_BINARY)
-                        cnts, _ = cv2.findContours(result_bin.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        for cnt in cnts:
-                            x, y, w, h = cv2.boundingRect(cnt)
-                            cx = min(x + w // 2, result.shape[1] - 1)
-                            cy = min(y + h // 2, result.shape[0] - 1)
-                            all_boxes.append((px + x, py + y, px + x + rw, py + y + rh, float(result[cy, cx])))
-            kept = self._nms(all_boxes)
-            self.results.emit(entry.id, kept)
-            self.progress.emit(i + 1, total)
+        session = Session(self._engine)
+        try:
+            if hasattr(self._task, "_progress_cb"):
+                self._task._progress_cb = self.progress.emit
+            self._task.execute(self._project, session)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            self.error.emit(str(e))
+        finally:
+            session.close()
         self.finished.emit()
 
     def _color_patches(self, samples, page_bgr, pw, ph):
@@ -786,27 +797,60 @@ class CountSymbolsWorker(QObject):
         th = max(s.image.shape[0] for s in samples)
         page_hsv = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2HSV)
         hue = dominant_hue
-        lo1 = np.array([max(hue - self.HUE_TOLERANCE, 0), self.COLOR_SAT_MIN, 30], dtype=np.uint8)
+        lo1 = np.array(
+            [max(hue - self.HUE_TOLERANCE, 0), self.COLOR_SAT_MIN, 30], dtype=np.uint8
+        )
         hi1 = np.array([min(hue + self.HUE_TOLERANCE, 179), 255, 255], dtype=np.uint8)
         color_mask = cv2.inRange(page_hsv, lo1, hi1)
         if hue - self.HUE_TOLERANCE < 0:
-            lo2 = np.array([179 + hue - self.HUE_TOLERANCE, self.COLOR_SAT_MIN, 30], dtype=np.uint8)
-            color_mask = cv2.bitwise_or(color_mask, cv2.inRange(page_hsv, lo2, np.array([179, 255, 255], dtype=np.uint8)))
+            lo2 = np.array(
+                [179 + hue - self.HUE_TOLERANCE, self.COLOR_SAT_MIN, 30], dtype=np.uint8
+            )
+            color_mask = cv2.bitwise_or(
+                color_mask,
+                cv2.inRange(page_hsv, lo2, np.array([179, 255, 255], dtype=np.uint8)),
+            )
         elif hue + self.HUE_TOLERANCE > 179:
             hi2 = np.array([hue + self.HUE_TOLERANCE - 179, 255, 255], dtype=np.uint8)
-            color_mask = cv2.bitwise_or(color_mask, cv2.inRange(page_hsv, np.array([0, self.COLOR_SAT_MIN, 30], dtype=np.uint8), hi2))
-        cnts, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        rects = [[x, y, x + w, y + h] for cnt in cnts for x, y, w, h in [cv2.boundingRect(cnt)] if w * h >= self.MIN_BLOB_AREA]
+            color_mask = cv2.bitwise_or(
+                color_mask,
+                cv2.inRange(
+                    page_hsv, np.array([0, self.COLOR_SAT_MIN, 30], dtype=np.uint8), hi2
+                ),
+            )
+        cnts, _ = cv2.findContours(
+            color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        rects = [
+            [x, y, x + w, y + h]
+            for cnt in cnts
+            for x, y, w, h in [cv2.boundingRect(cnt)]
+            if w * h >= self.MIN_BLOB_AREA
+        ]
         if not rects:
             return [(0, 0, page_bgr)]
         merged = self._merge_rects(rects, tw, th)
-        return [(max(x1 - tw, 0), max(y1 - th, 0), page_bgr[max(y1-th,0):min(y2+th,ph), max(x1-tw,0):min(x2+tw,pw)]) for x1, y1, x2, y2 in merged]
+        return [
+            (
+                max(x1 - tw, 0),
+                max(y1 - th, 0),
+                page_bgr[
+                    max(y1 - th, 0) : min(y2 + th, ph),
+                    max(x1 - tw, 0) : min(x2 + tw, pw),
+                ],
+            )
+            for x1, y1, x2, y2 in merged
+        ]
 
     def _dominant_color(self, samples):
         all_fg = []
         for s in samples:
             hsv = cv2.cvtColor(s.image, cv2.COLOR_BGR2HSV)
-            fg = hsv[s.mask > 0] if s.mask is not None and s.mask.shape == s.image.shape[:2] else hsv.reshape(-1, 3)
+            fg = (
+                hsv[s.mask > 0]
+                if s.mask is not None and s.mask.shape == s.image.shape[:2]
+                else hsv.reshape(-1, 3)
+            )
             all_fg.append(fg)
         fg = np.concatenate(all_fg) if all_fg else np.empty((0, 3), dtype=np.uint8)
         if len(fg) == 0:
@@ -829,7 +873,12 @@ class CountSymbolsWorker(QObject):
                     if i == j or used[j]:
                         continue
                     bx1, by1, bx2, by2 = b
-                    if ax2 + tw >= bx1 and bx2 + tw >= ax1 and ay2 + th >= by1 and by2 + th >= ay1:
+                    if (
+                        ax2 + tw >= bx1
+                        and bx2 + tw >= ax1
+                        and ay2 + th >= by1
+                        and by2 + th >= ay1
+                    ):
                         ax1, ay1 = min(ax1, bx1), min(ay1, by1)
                         ax2, ay2 = max(ax2, bx2), max(ay2, by2)
                         used[j] = True
@@ -850,68 +899,248 @@ class CountSymbolsWorker(QObject):
                 kx1, ky1, kx2, ky2 = kb[:4]
                 ix1, iy1 = max(x1, kx1), max(y1, ky1)
                 ix2, iy2 = min(x2, kx2), min(y2, ky2)
-                if ix2 > ix1 and iy2 > iy1 and (ix2-ix1)*(iy2-iy1) / ((x2-x1)*(y2-y1)) > overlap:
+                if (
+                    ix2 > ix1
+                    and iy2 > iy1
+                    and (ix2 - ix1) * (iy2 - iy1) / ((x2 - x1) * (y2 - y1)) > overlap
+                ):
                     break
             else:
                 kept.append(box)
         return kept
 
 
-class CountSymbols(Command):
-    def __init__(self, page: "Page", entries: list[LegendEntry]):
-        self._page = page
+class CountSymbols(Task):
+    THRESHOLD = 0.6
+    COLOR_SAT_MIN = 30
+    HUE_TOLERANCE = 12
+    MIN_BLOB_AREA = 16
+
+    def __init__(self, page_id: int, page_bgr: np.ndarray, entries: list[LegendEntry]):
+        self._page_id = page_id
+        self._page_bgr = page_bgr
         self._entries = entries
-        self._old_markers: list[Marker] = []
-        self._new_markers: list[Marker] = []
+        self._progress_cb = None
 
     def execute(self, project, session):
         entry_ids = {e.id for e in self._entries}
-        self._old_markers = [m for m in self._page.markers if m.source == "auto" and m.legend_entry_id in entry_ids]
-        for m in self._old_markers:
-            self._page.markers.remove(m)
+        for m in (
+            session.execute(
+                select(Marker).where(
+                    Marker.page_id == self._page_id,
+                    Marker.source == "auto",
+                    Marker.legend_entry_id.in_(entry_ids),
+                )
+            )
+            .scalars()
+            .all()
+        ):
             session.delete(m)
         session.flush()
 
-        if self._new_markers:
-            # redo path: replay cached results without re-running the worker
-            cached, self._new_markers = self._new_markers, []
-            for m in cached:
-                make_transient(m)
-                m.id = None
-                self._page.markers.append(m)
-                session.add(m)
-            session.flush()
-            self._new_markers = [m for m in self._page.markers if m.source == "auto" and m.legend_entry_id in entry_ids]
-            for e in self._entries:
-                e.dirty = False
-            project.notify_markers_changed()
+        manual = (
+            session.execute(
+                select(Marker).where(
+                    Marker.page_id == self._page_id,
+                    Marker.source == "manual",
+                    Marker.legend_entry_id.in_(entry_ids),
+                )
+            )
+            .scalars()
+            .all()
+        )
 
-    def apply_results(self, project, session, entry_id: int, boxes: list):
-        entry = next(e for e in self._entries if e.id == entry_id)
-        for x1, y1, x2, y2, score in boxes:
-            m = Marker(legend_entry_id=entry_id, page_id=self._page.id, x=x1, y=y1, w=x2-x1, h=y2-y1, score=score, source="auto")
-            self._page.markers.append(m)
-            session.add(m)
-            self._new_markers.append(m)
-        entry.dirty = False
-        session.flush()
-        project.notify_markers_changed()
+        ph, pw = self._page_bgr.shape[:2]
+        total = len(self._entries)
+        for i, entry in enumerate(self._entries):
+            entry_manual = [m for m in manual if m.legend_entry_id == entry.id]
+            patches = self._color_patches(entry.samples, self._page_bgr, pw, ph)
+            all_boxes = []
+            for sample in entry.samples:
+                rotations = [sample.image] + [
+                    cv2.rotate(sample.image, f)
+                    for f in (
+                        cv2.ROTATE_90_CLOCKWISE,
+                        cv2.ROTATE_180,
+                        cv2.ROTATE_90_COUNTERCLOCKWISE,
+                    )
+                ]
+                for rot in rotations:
+                    rh, rw = rot.shape[:2]
+                    for px, py, patch in patches:
+                        if patch.shape[0] < rh or patch.shape[1] < rw:
+                            continue
+                        result = cv2.matchTemplate(patch, rot, cv2.TM_CCOEFF_NORMED)
+                        _, result_bin = cv2.threshold(
+                            result, self.THRESHOLD, 255, cv2.THRESH_BINARY
+                        )
+                        cnts, _ = cv2.findContours(
+                            result_bin.astype(np.uint8),
+                            cv2.RETR_EXTERNAL,
+                            cv2.CHAIN_APPROX_SIMPLE,
+                        )
+                        for cnt in cnts:
+                            x, y, w, h = cv2.boundingRect(cnt)
+                            cx = min(x + w // 2, result.shape[1] - 1)
+                            cy = min(y + h // 2, result.shape[0] - 1)
+                            all_boxes.append(
+                                (
+                                    px + x,
+                                    py + y,
+                                    px + x + rw,
+                                    py + y + rh,
+                                    float(result[cy, cx]),
+                                )
+                            )
+            for x1, y1, x2, y2, score in self._nms(all_boxes):
+                if any(
+                    x1 < m.x + m.w and x2 > m.x and y1 < m.y + m.h and y2 > m.y
+                    for m in entry_manual
+                ):
+                    continue
+                session.add(
+                    Marker(
+                        legend_entry_id=entry.id,
+                        page_id=self._page_id,
+                        x=x1,
+                        y=y1,
+                        w=x2 - x1,
+                        h=y2 - y1,
+                        score=score,
+                        source="auto",
+                    )
+                )
+            if self._progress_cb:
+                self._progress_cb(i + 1, total)
 
-    def undo(self, project, session):
-        for m in self._new_markers:
-            self._page.markers.remove(m)
-            session.delete(m)
-        session.flush()
-        for m in self._old_markers:
-            make_transient(m)
-            m.id = None
-            m.source = "auto"
-            self._page.markers.append(m)
-            session.add(m)
-        session.flush()
+    def complete(self, project, session):
+        page = project.active_page
+        if page and page.id == self._page_id:
+            session.expire(page, ["markers"])
+            _ = page.markers
         for e in self._entries:
-            e.dirty = True
+            e.dirty = False
         project.notify_markers_changed()
+
+    def _color_patches(self, samples, page_bgr, pw, ph):
+        dominant_hue, dominant_sat = self._dominant_color(samples)
+        if dominant_sat < self.COLOR_SAT_MIN:
+            return [(0, 0, page_bgr)]
+        tw = max(s.image.shape[1] for s in samples)
+        th = max(s.image.shape[0] for s in samples)
+        page_hsv = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2HSV)
+        hue = dominant_hue
+        lo1 = np.array(
+            [max(hue - self.HUE_TOLERANCE, 0), self.COLOR_SAT_MIN, 30], dtype=np.uint8
+        )
+        hi1 = np.array([min(hue + self.HUE_TOLERANCE, 179), 255, 255], dtype=np.uint8)
+        color_mask = cv2.inRange(page_hsv, lo1, hi1)
+        if hue - self.HUE_TOLERANCE < 0:
+            lo2 = np.array(
+                [179 + hue - self.HUE_TOLERANCE, self.COLOR_SAT_MIN, 30], dtype=np.uint8
+            )
+            color_mask = cv2.bitwise_or(
+                color_mask,
+                cv2.inRange(page_hsv, lo2, np.array([179, 255, 255], dtype=np.uint8)),
+            )
+        elif hue + self.HUE_TOLERANCE > 179:
+            hi2 = np.array([hue + self.HUE_TOLERANCE - 179, 255, 255], dtype=np.uint8)
+            color_mask = cv2.bitwise_or(
+                color_mask,
+                cv2.inRange(
+                    page_hsv, np.array([0, self.COLOR_SAT_MIN, 30], dtype=np.uint8), hi2
+                ),
+            )
+        cnts, _ = cv2.findContours(
+            color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        rects = [
+            [x, y, x + w, y + h]
+            for cnt in cnts
+            for x, y, w, h in [cv2.boundingRect(cnt)]
+            if w * h >= self.MIN_BLOB_AREA
+        ]
+        if not rects:
+            return [(0, 0, page_bgr)]
+        merged = self._merge_rects(rects, tw, th)
+        return [
+            (
+                max(x1 - tw, 0),
+                max(y1 - th, 0),
+                page_bgr[
+                    max(y1 - th, 0) : min(y2 + th, ph),
+                    max(x1 - tw, 0) : min(x2 + tw, pw),
+                ],
+            )
+            for x1, y1, x2, y2 in merged
+        ]
+
+    def _dominant_color(self, samples):
+        all_fg = []
+        for s in samples:
+            hsv = cv2.cvtColor(s.image, cv2.COLOR_BGR2HSV)
+            fg = (
+                hsv[s.mask > 0]
+                if s.mask is not None and s.mask.shape == s.image.shape[:2]
+                else hsv.reshape(-1, 3)
+            )
+            all_fg.append(fg)
+        fg = np.concatenate(all_fg) if all_fg else np.empty((0, 3), dtype=np.uint8)
+        if len(fg) == 0:
+            return 0, 0
+        sat = fg[:, 1].astype(float)
+        weights = sat / (sat.sum() + 1e-6)
+        return int(np.average(fg[:, 0], weights=weights)), int(fg[:, 1].mean())
+
+    def _merge_rects(self, rects, tw, th):
+        changed = True
+        while changed:
+            changed = False
+            merged = []
+            used = [False] * len(rects)
+            for i, a in enumerate(rects):
+                if used[i]:
+                    continue
+                ax1, ay1, ax2, ay2 = a
+                for j, b in enumerate(rects):
+                    if i == j or used[j]:
+                        continue
+                    bx1, by1, bx2, by2 = b
+                    if (
+                        ax2 + tw >= bx1
+                        and bx2 + tw >= ax1
+                        and ay2 + th >= by1
+                        and by2 + th >= ay1
+                    ):
+                        ax1, ay1 = min(ax1, bx1), min(ay1, by1)
+                        ax2, ay2 = max(ax2, bx2), max(ay2, by2)
+                        used[j] = True
+                        changed = True
+                merged.append([ax1, ay1, ax2, ay2])
+                used[i] = True
+            rects = merged
+        return rects
+
+    def _nms(self, boxes, overlap=0.3):
+        if not boxes:
+            return []
+        boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+        kept = []
+        for box in boxes:
+            x1, y1, x2, y2 = box[:4]
+            for kb in kept:
+                kx1, ky1, kx2, ky2 = kb[:4]
+                ix1, iy1 = max(x1, kx1), max(y1, ky1)
+                ix2, iy2 = min(x2, kx2), min(y2, ky2)
+                if (
+                    ix2 > ix1
+                    and iy2 > iy1
+                    and (ix2 - ix1) * (iy2 - iy1) / ((x2 - x1) * (y2 - y1)) > overlap
+                ):
+                    break
+            else:
+                kept.append(box)
+        return kept
 
 
 class PointGesture:
@@ -984,7 +1213,9 @@ def start_add_legend_entry(controller, parent):
             return
         label, ok = QInputDialog.getText(parent, "New Entry", "Label:")
         if ok and label.strip():
-            controller.dispatch(AddLegendEntryFromSample(label.strip(), qpixmap_to_bgr(crop)))
+            controller.dispatch(
+                AddLegendEntryFromSample(label.strip(), qpixmap_to_bgr(crop))
+            )
         controller.set_tool(None)
 
     controller.set_tool(RectGesture(on_complete=on_complete))
@@ -999,9 +1230,10 @@ class AppController(QObject):
         super().__init__()
         self._project = project
         self._session = session
+        self._engine = None
         self._canvas = None
         self._thread: QThread | None = None
-        self._worker: CountSymbolsWorker | None = None
+        self._worker: QObject | None = None
         self._autosave_timer = QTimer()
         self._autosave_timer.setInterval(30_000)
         self._autosave_timer.timeout.connect(self._autosave)
@@ -1019,8 +1251,9 @@ class AppController(QObject):
     def set_canvas(self, canvas):
         self._canvas = canvas
 
-    def set_session(self, session: Session):
+    def set_session(self, session: Session, engine):
         self._session = session
+        self._engine = engine
 
     def set_tool(self, tool):
         self._canvas.set_tool(tool)
@@ -1035,35 +1268,27 @@ class AppController(QObject):
         else:
             task.execute(self._project, self._session)
 
-    def dispatch_count(self):
-        page = self._project.active_page
-        if page is None or page.pixmap is None:
-            return
-        entries = [e for e in self._project.legend_entries if e.auto_count and e.samples and e.dirty]
-        if not entries:
-            return
-
-        cmd = CountSymbols(page, entries)
-        cmd.execute(self._project, self._session)
-        page.undo_stack.append(cmd)
-        page.redo_stack.clear()
-
-        page_bgr = qpixmap_to_bgr(page.pixmap)
-        worker = CountSymbolsWorker(entries, page_bgr)
+    def dispatch_async(self, task: Task, label: str):
+        self._session.commit()
+        worker = TaskWorker(task, self._project, self._engine)
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.results.connect(lambda entry_id, boxes: cmd.apply_results(self._project, self._session, entry_id, boxes))
         worker.progress.connect(self.task_progress)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self.task_finished)
-        thread.finished.connect(lambda: setattr(self, '_thread', None))
+        thread.finished.connect(lambda: self._on_async_done(task))
         self._thread = thread
         self._worker = worker
-        self.task_started.emit("Counting symbols...")
+        self.task_started.emit(label)
         thread.start()
+
+    def _on_async_done(self, task: Task):
+        if hasattr(task, "complete"):
+            task.complete(self._project, self._session)
+        self.task_finished.emit()
+        self._thread = None
 
     def undo(self):
         page = self._project.active_page
@@ -1289,15 +1514,22 @@ class PDFViewer(QGraphicsView):
         if self._pan_origin is not None:
             delta = event.pos() - self._pan_origin
             self._pan_origin = event.pos()
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x()
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y()
+            )
             return
         if self._active_tool:
             self._active_tool.on_move(self.mapToScene(event.pos()))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.MiddleButton and self._pan_origin is not None:
+        if (
+            event.button() == Qt.MouseButton.MiddleButton
+            and self._pan_origin is not None
+        ):
             self._pan_origin = None
             if self._active_tool and self._active_tool.cursor is not None:
                 self.setCursor(self._active_tool.cursor)
@@ -1379,7 +1611,9 @@ class ZoneCountsPanel(QDockWidget):
         self._project = controller.project
         self._table = QTableWidget()
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
         self.setWidget(self._table)
         self._project.active_page_changed.connect(self._rebuild)
         self._project.markers_changed.connect(self._rebuild)
@@ -1442,7 +1676,7 @@ class LandingWindow(QMainWindow):
         engine = _make_engine(path)
         Base.metadata.create_all(engine)
         _init_project_state(engine)
-        self._launch(Session(engine), path)
+        self._launch(Session(engine), engine, path)
 
     def _open_project(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1453,10 +1687,10 @@ class LandingWindow(QMainWindow):
         engine = _make_engine(path)
         Base.metadata.create_all(engine)
         _init_project_state(engine)
-        self._launch(Session(engine), path)
+        self._launch(Session(engine), engine, path)
 
-    def _launch(self, session, path):
-        self._controller.set_session(session)
+    def _launch(self, session, engine, path):
+        self._controller.set_session(session, engine)
         self._main = MainWindow(self._controller, path)
         self._main.show()
         self._controller.dispatch(LoadProject())
@@ -1480,7 +1714,9 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.legend_panel)
 
         self.zone_counts_panel = ZoneCountsPanel(controller)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.zone_counts_panel)
+        self.addDockWidget(
+            Qt.DockWidgetArea.BottomDockWidgetArea, self.zone_counts_panel
+        )
 
         self._project.legend_entries_changed.connect(
             lambda: self.legend_panel.set_entries(self._project.legend_entries)
@@ -1522,7 +1758,9 @@ class MainWindow(QMainWindow):
         self._toolbar.addAction(legend_action)
 
         add_entry_action = QAction("Add Entry", self)
-        add_entry_action.triggered.connect(lambda: start_add_legend_entry(self._controller, self))
+        add_entry_action.triggered.connect(
+            lambda: start_add_legend_entry(self._controller, self)
+        )
         self._toolbar.addAction(add_entry_action)
 
         set_symbol_action = QAction("Set Symbol", self)
@@ -1530,7 +1768,7 @@ class MainWindow(QMainWindow):
         self._toolbar.addAction(set_symbol_action)
 
         count_action = QAction("Count", self)
-        count_action.triggered.connect(self._controller.dispatch_count)
+        count_action.triggered.connect(self._dispatch_count)
         self._toolbar.addAction(count_action)
 
         add_marker_action = QAction("Add Marker", self)
@@ -1538,21 +1776,29 @@ class MainWindow(QMainWindow):
         self._toolbar.addAction(add_marker_action)
 
         delete_marker_action = QAction("Delete Marker", self)
-        delete_marker_action.triggered.connect(lambda: start_delete_marker(self._controller))
+        delete_marker_action.triggered.connect(
+            lambda: start_delete_marker(self._controller)
+        )
         self._toolbar.addAction(delete_marker_action)
 
         self._toolbar.addSeparator()
 
         draw_zone_poly_action = QAction("Draw Zone (Polygon)", self)
-        draw_zone_poly_action.triggered.connect(lambda: start_draw_zone_polygon(self._controller, self))
+        draw_zone_poly_action.triggered.connect(
+            lambda: start_draw_zone_polygon(self._controller, self)
+        )
         self._toolbar.addAction(draw_zone_poly_action)
 
         draw_zone_rect_action = QAction("Draw Zone (Rect)", self)
-        draw_zone_rect_action.triggered.connect(lambda: start_draw_zone_rect(self._controller, self))
+        draw_zone_rect_action.triggered.connect(
+            lambda: start_draw_zone_rect(self._controller, self)
+        )
         self._toolbar.addAction(draw_zone_rect_action)
 
         delete_zone_action = QAction("Delete Zone", self)
-        delete_zone_action.triggered.connect(lambda: start_delete_zone(self._controller))
+        delete_zone_action.triggered.connect(
+            lambda: start_delete_zone(self._controller)
+        )
         self._toolbar.addAction(delete_zone_action)
 
         undo_action = QAction("Undo", self)
@@ -1585,17 +1831,37 @@ class MainWindow(QMainWindow):
         if page:
             self.viewer.show_page(page)
 
+    def _dispatch_count(self):
+        page = self._project.active_page
+        if page is None or page.pixmap is None:
+            return
+        entries = [
+            e
+            for e in self._project.legend_entries
+            if e.auto_count and e.samples and e.dirty
+        ]
+        if not entries:
+            return
+        page_bgr = qpixmap_to_bgr(page.pixmap)
+        self._controller.dispatch_async(
+            CountSymbols(page.id, page_bgr, entries), "Counting symbols..."
+        )
+
     def _add_marker_mode(self):
         entry = self.legend_panel.selected_entry()
         if entry is None:
-            QMessageBox.information(self, "No Selection", "Select a legend entry first.")
+            QMessageBox.information(
+                self, "No Selection", "Select a legend entry first."
+            )
             return
         start_add_marker(self._controller, entry)
 
     def _set_symbol(self):
         entry = self.legend_panel.selected_entry()
         if entry is None:
-            QMessageBox.information(self, "No Selection", "Select a legend entry first.")
+            QMessageBox.information(
+                self, "No Selection", "Select a legend entry first."
+            )
             return
         start_set_symbol(self._controller, entry)
 
