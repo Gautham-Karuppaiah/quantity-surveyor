@@ -307,7 +307,8 @@ def pixmap_from_bytes(data: bytes) -> QPixmap:
 def load_page(page: Page, session: Session) -> None:
     session.refresh(page, ["image_data"])
     page.pixmap = pixmap_from_bytes(page.image_data)
-    _ = page.zones  # eagerly load zones into the session identity map
+    _ = page.markers
+    _ = page.zones
 
 
 def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
@@ -459,6 +460,35 @@ class LoadProject(Task):
         )
         page = active_drawing.pages[last_page_index]
         load_page(page, session)
+        project.active_page = page
+
+
+class SwitchPage(Task):
+    def __init__(self, page: "Page"):
+        self._page = page
+
+    def execute(self, project, session):
+        if self._page.pixmap is None:
+            load_page(self._page, session)
+        drawing = self._page.drawing
+        drawing.last_page = self._page.page_number
+        drawing.last_page_index = drawing.pages.index(self._page)
+        project.active_page = self._page
+
+
+class SwitchDrawing(Task):
+    def __init__(self, drawing: "Drawing"):
+        self._drawing = drawing
+
+    def execute(self, project, session):
+        project.active_drawing = self._drawing
+        last_page_index = min(
+            self._drawing.last_page_index, len(self._drawing.pages) - 1
+        )
+        page = self._drawing.pages[last_page_index]
+        if page.pixmap is None:
+            load_page(page, session)
+        self._drawing.last_page = page.page_number
         project.active_page = page
 
 
@@ -1566,6 +1596,42 @@ class LegendList(QListWidget):
             super().wheelEvent(event)
 
 
+class DrawingsPanel(QDockWidget):
+    def __init__(self, controller: "AppController"):
+        super().__init__("Drawings")
+        self._controller = controller
+        self._project = controller.project
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.itemDoubleClicked.connect(self._on_double_click)
+        self.setWidget(self._tree)
+        self._project.drawings_changed.connect(self._rebuild)
+        self._project.active_page_changed.connect(self._rebuild)
+        self._rebuild()
+
+    def _rebuild(self):
+        self._tree.clear()
+        active_page = self._project.active_page
+        for drawing in self._project.drawings:
+            d_item = QTreeWidgetItem([drawing.name])
+            d_item.setData(0, Qt.ItemDataRole.UserRole, drawing)
+            for page in drawing.pages:
+                p_item = QTreeWidgetItem([f"Page {page.page_number + 1}"])
+                p_item.setData(0, Qt.ItemDataRole.UserRole, page)
+                d_item.addChild(p_item)
+                if page is active_page:
+                    p_item.setSelected(True)
+            self._tree.addTopLevelItem(d_item)
+            d_item.setExpanded(True)
+
+    def _on_double_click(self, item, _column):
+        obj = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(obj, Page):
+            self._controller.dispatch(SwitchPage(obj))
+        elif isinstance(obj, Drawing):
+            self._controller.dispatch(SwitchDrawing(obj))
+
+
 class LegendPanel(QDockWidget):
     def __init__(self):
         super().__init__("Legend")
@@ -1709,6 +1775,9 @@ class MainWindow(QMainWindow):
         self.viewer = PDFViewer()
         self.setCentralWidget(self.viewer)
         self._controller.set_canvas(self.viewer)
+
+        self.drawings_panel = DrawingsPanel(controller)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.drawings_panel)
 
         self.legend_panel = LegendPanel()
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.legend_panel)
