@@ -418,6 +418,48 @@ class AddLegendEntryFromSample(Task):
         project.add_legend_entries([entry])
 
 
+class RemoveLegendEntry(Task):
+    def __init__(self, entry: LegendEntry):
+        self._entry = entry
+
+    def execute(self, project, session):
+        session.delete(self._entry)
+        session.flush()
+        project.legend_entries.remove(self._entry)
+        for drawing in project.drawings:
+            for page in drawing.pages:
+                if page.pixmap is not None:
+                    page.markers[:] = [
+                        m for m in page.markers if m.legend_entry_id != self._entry.id
+                    ]
+        project.notify_legend_entries_changed()
+        project.notify_markers_changed()
+
+
+class RemoveSample(Task):
+    def __init__(self, entry: LegendEntry, sample: "Sample"):
+        self._entry = entry
+        self._sample = sample
+
+    def execute(self, project, session):
+        self._entry.samples.remove(self._sample)
+        session.delete(self._sample)
+        session.flush()
+        self._entry.dirty = True
+        project.notify_legend_entries_changed()
+
+
+class RenameLegendEntry(Task):
+    def __init__(self, entry: LegendEntry, label: str):
+        self._entry = entry
+        self._label = label
+
+    def execute(self, project, session):
+        self._entry.label = self._label
+        session.flush()
+        project.notify_legend_entries_changed()
+
+
 class LoadProject(Task):
     def execute(self, project, session):
         drawings = list(session.scalars(select(Drawing)))
@@ -564,6 +606,9 @@ class Project(QObject):
         self.legend_entries_changed.emit()
 
     def set_legend_entry_sample(self, entry: LegendEntry):
+        self.legend_entries_changed.emit()
+
+    def notify_legend_entries_changed(self):
         self.legend_entries_changed.emit()
 
     def notify_markers_changed(self):
@@ -1575,27 +1620,6 @@ class PDFViewer(QGraphicsView):
         self.zoom(event.angleDelta().y())
 
 
-class LegendList(QListWidget):
-    BASE_SIZE = 80
-
-    def __init__(self):
-        super().__init__()
-        self._icon_size = self.BASE_SIZE
-        self.setIconSize(QSize(self._icon_size, self._icon_size))
-        self.setWordWrap(True)
-        font = self.font()
-        font.setPointSize(15)
-        self.setFont(font)
-
-    def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            factor = 1.1 if event.angleDelta().y() > 0 else 1 / 1.1
-            self._icon_size = max(40, min(600, round(self._icon_size * factor)))
-            self.setIconSize(QSize(self._icon_size, self._icon_size))
-        else:
-            super().wheelEvent(event)
-
-
 class DrawingsPanel(QDockWidget):
     def __init__(self, controller: "AppController"):
         super().__init__("Drawings")
@@ -1633,23 +1657,100 @@ class DrawingsPanel(QDockWidget):
 
 
 class LegendPanel(QDockWidget):
-    def __init__(self):
-        super().__init__("Legend")
-        self._list = LegendList()
-        self.setWidget(self._list)
+    ICON_SIZE = 80
 
-    def set_entries(self, entries: list[LegendEntry]):
-        self._entries = entries
-        self._list.clear()
-        for entry in entries:
-            item = QListWidgetItem(QIcon(entry.pixmap), entry.label)
-            self._list.addItem(item)
+    def __init__(self, controller: "AppController"):
+        super().__init__("Legend")
+        self._controller = controller
+        self._project = controller.project
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setIconSize(QSize(self.ICON_SIZE, self.ICON_SIZE))
+        self._tree.setWordWrap(True)
+        font = self._tree.font()
+        font.setPointSize(11)
+        self._tree.setFont(font)
+
+        self._remove_btn = QPushButton("Remove")
+        self._rename_btn = QPushButton("Rename")
+        self._remove_btn.clicked.connect(self._on_remove)
+        self._rename_btn.clicked.connect(self._on_rename)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self._remove_btn)
+        btn_row.addWidget(self._rename_btn)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self._tree)
+        layout.addLayout(btn_row)
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setWidget(container)
+
+        self._project.legend_entries_changed.connect(self._rebuild)
+        self._project.markers_changed.connect(self._rebuild)
+        self._rebuild()
+
+    def _rebuild(self):
+        self._tree.clear()
+        page = self._project.active_page
+        marker_counts = {}
+        if page:
+            for m in page.markers:
+                marker_counts[m.legend_entry_id] = (
+                    marker_counts.get(m.legend_entry_id, 0) + 1
+                )
+        for entry in self._project.legend_entries:
+            count = marker_counts.get(entry.id, 0)
+            e_item = QTreeWidgetItem([f"{entry.label}  ({count})"])
+            if entry.pixmap:
+                e_item.setIcon(0, QIcon(entry.pixmap))
+            e_item.setData(0, Qt.ItemDataRole.UserRole, entry)
+            for sample in entry.samples:
+                s_item = QTreeWidgetItem([f"Sample {entry.samples.index(sample) + 1}"])
+                if sample.pixmap:
+                    s_item.setIcon(0, QIcon(sample.pixmap))
+                s_item.setData(0, Qt.ItemDataRole.UserRole, sample)
+                e_item.addChild(s_item)
+            self._tree.addTopLevelItem(e_item)
+            e_item.setExpanded(True)
 
     def selected_entry(self) -> LegendEntry | None:
-        row = self._list.currentRow()
-        if row < 0 or not hasattr(self, "_entries"):
+        item = self._tree.currentItem()
+        if item is None:
             return None
-        return self._entries[row]
+        obj = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(obj, LegendEntry):
+            return obj
+        if isinstance(obj, Sample):
+            parent = item.parent()
+            if parent:
+                return parent.data(0, Qt.ItemDataRole.UserRole)
+        return None
+
+    def _selected_obj(self):
+        item = self._tree.currentItem()
+        return item.data(0, Qt.ItemDataRole.UserRole) if item else None
+
+    def _on_remove(self):
+        obj = self._selected_obj()
+        if isinstance(obj, LegendEntry):
+            self._controller.dispatch(RemoveLegendEntry(obj))
+        elif isinstance(obj, Sample):
+            parent = self._tree.currentItem().parent()
+            if parent:
+                entry = parent.data(0, Qt.ItemDataRole.UserRole)
+                self._controller.dispatch(RemoveSample(entry, obj))
+
+    def _on_rename(self):
+        obj = self._selected_obj()
+        if not isinstance(obj, LegendEntry):
+            return
+        label, ok = QInputDialog.getText(self, "Rename Entry", "Label:", text=obj.label)
+        if ok and label.strip():
+            self._controller.dispatch(RenameLegendEntry(obj, label.strip()))
 
 
 def _zone_counts(page, entries: list) -> dict:
@@ -1779,7 +1880,7 @@ class MainWindow(QMainWindow):
         self.drawings_panel = DrawingsPanel(controller)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.drawings_panel)
 
-        self.legend_panel = LegendPanel()
+        self.legend_panel = LegendPanel(controller)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.legend_panel)
 
         self.zone_counts_panel = ZoneCountsPanel(controller)
@@ -1787,9 +1888,6 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.BottomDockWidgetArea, self.zone_counts_panel
         )
 
-        self._project.legend_entries_changed.connect(
-            lambda: self.legend_panel.set_entries(self._project.legend_entries)
-        )
         self._project.active_page_changed.connect(self._on_active_page_changed)
         self._project.markers_changed.connect(
             lambda: self.viewer.set_markers(
