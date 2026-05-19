@@ -4,6 +4,8 @@ import signal
 import sys
 from collections import deque
 
+import xlsxwriter
+
 import cv2
 import fitz
 import numpy as np
@@ -571,6 +573,85 @@ class ImportDrawing(Task):
             first_page = drawing.pages[0]
             load_page(first_page, session)
             project.active_page = first_page
+
+
+class ExportProject(Task):
+    def __init__(self, output_path: str):
+        self._output_path = output_path
+
+    def execute(self, project, session):
+        entries = session.scalars(select(LegendEntry).order_by(LegendEntry.id)).all()
+        drawings = session.scalars(select(Drawing).order_by(Drawing.id)).all()
+
+        rows = []
+        for drawing in drawings:
+            for page in drawing.pages:
+                if not page.zones:
+                    continue
+                counts = _zone_counts(page, [])
+                for zone in page.zones:
+                    rows.append(
+                        (
+                            drawing.name,
+                            f"Page {page.page_number + 1}",
+                            zone.name,
+                            zone.id,
+                            counts,
+                        )
+                    )
+
+        workbook = xlsxwriter.Workbook(self._output_path)
+        ws = workbook.add_worksheet("Counts")
+
+        header_fmt = workbook.add_format(
+            {"bold": True, "align": "center", "valign": "vcenter", "border": 1}
+        )
+        cell_fmt = workbook.add_format(
+            {"align": "center", "valign": "vcenter", "border": 1}
+        )
+
+        for col, label in enumerate(
+            ["Drawing", "Page", "Zone"] + [e.label for e in entries]
+        ):
+            ws.write(0, col, label, header_fmt)
+
+        for n, (_, _, zone_name, zone_id, counts) in enumerate(rows):
+            r = 1 + n
+            ws.write(r, 2, zone_name, cell_fmt)
+            for c, entry in enumerate(entries):
+                ws.write(r, 3 + c, counts.get((zone_id, entry.id), 0), cell_fmt)
+
+        i = 0
+        while i < len(rows):
+            drawing_name = rows[i][0]
+            j = i + 1
+            while j < len(rows) and rows[j][0] == drawing_name:
+                j += 1
+            r_start, r_end = 1 + i, j
+            if r_start == r_end:
+                ws.write(r_start, 0, drawing_name, cell_fmt)
+            else:
+                ws.merge_range(r_start, 0, r_end, 0, drawing_name, cell_fmt)
+            i = j
+
+        i = 0
+        while i < len(rows):
+            page_label, drawing_name = rows[i][1], rows[i][0]
+            j = i + 1
+            while (
+                j < len(rows)
+                and rows[j][1] == page_label
+                and rows[j][0] == drawing_name
+            ):
+                j += 1
+            r_start, r_end = 1 + i, j
+            if r_start == r_end:
+                ws.write(r_start, 1, page_label, cell_fmt)
+            else:
+                ws.merge_range(r_start, 1, r_end, 1, page_label, cell_fmt)
+            i = j
+
+        workbook.close()
 
 
 class Project(QObject):
@@ -1839,6 +1920,12 @@ class MainWindow(QMainWindow):
 
         self._toolbar.addSeparator()
 
+        export_action = QAction("Export", self)
+        export_action.triggered.connect(self._export)
+        self._toolbar.addAction(export_action)
+
+        self._toolbar.addSeparator()
+
         draw_zone_poly_action = QAction("Draw Zone (Polygon)", self)
         draw_zone_poly_action.triggered.connect(
             lambda: start_draw_zone_polygon(self._controller, self)
@@ -1920,6 +2007,16 @@ class MainWindow(QMainWindow):
             )
             return
         start_set_symbol(self._controller, entry)
+
+    def _export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export", "", "Excel Files (*.xlsx)"
+        )
+        if not path:
+            return
+        if not path.endswith(".xlsx"):
+            path += ".xlsx"
+        self._controller.dispatch(ExportProject(path))
 
     def _import_drawing(self):
         path, _ = QFileDialog.getOpenFileName(

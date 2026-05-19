@@ -1,0 +1,7 @@
+opencv-contrib-python==4.13.0.92
+PyMuPDF==1.27.2.3
+numpy==2.4.4
+img2table[easyocr]==1.4.2
+easyocr==1.7.2
+SQLAlchemy==2.0.49
+PyQt6==6.11.0
