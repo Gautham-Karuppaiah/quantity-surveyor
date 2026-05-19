@@ -31,13 +31,14 @@ from PyQt6.QtWidgets import (
     QGraphicsPathItem,
     QGraphicsTextItem,
     QDockWidget,
-    QListWidget,
-    QListWidgetItem,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QHeaderView,
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
     QPushButton,
     QLabel,
     QMessageBox,
@@ -559,7 +560,11 @@ class ImportDrawing(Task):
                 self._progress_cb(i + 1, total)
         session.flush()
         doc.close()
+        self._drawing_id = drawing.id
 
+    def complete(self, project, session):
+        drawing = session.get(Drawing, self._drawing_id)
+        drawing.last_page_index = 0
         project.add_drawing(drawing)
         project.active_drawing = drawing
         if drawing.pages:
@@ -868,126 +873,6 @@ class TaskWorker(QObject):
         finally:
             session.close()
         self.finished.emit()
-
-    def _color_patches(self, samples, page_bgr, pw, ph):
-        dominant_hue, dominant_sat = self._dominant_color(samples)
-        if dominant_sat < self.COLOR_SAT_MIN:
-            return [(0, 0, page_bgr)]
-        tw = max(s.image.shape[1] for s in samples)
-        th = max(s.image.shape[0] for s in samples)
-        page_hsv = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2HSV)
-        hue = dominant_hue
-        lo1 = np.array(
-            [max(hue - self.HUE_TOLERANCE, 0), self.COLOR_SAT_MIN, 30], dtype=np.uint8
-        )
-        hi1 = np.array([min(hue + self.HUE_TOLERANCE, 179), 255, 255], dtype=np.uint8)
-        color_mask = cv2.inRange(page_hsv, lo1, hi1)
-        if hue - self.HUE_TOLERANCE < 0:
-            lo2 = np.array(
-                [179 + hue - self.HUE_TOLERANCE, self.COLOR_SAT_MIN, 30], dtype=np.uint8
-            )
-            color_mask = cv2.bitwise_or(
-                color_mask,
-                cv2.inRange(page_hsv, lo2, np.array([179, 255, 255], dtype=np.uint8)),
-            )
-        elif hue + self.HUE_TOLERANCE > 179:
-            hi2 = np.array([hue + self.HUE_TOLERANCE - 179, 255, 255], dtype=np.uint8)
-            color_mask = cv2.bitwise_or(
-                color_mask,
-                cv2.inRange(
-                    page_hsv, np.array([0, self.COLOR_SAT_MIN, 30], dtype=np.uint8), hi2
-                ),
-            )
-        cnts, _ = cv2.findContours(
-            color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        rects = [
-            [x, y, x + w, y + h]
-            for cnt in cnts
-            for x, y, w, h in [cv2.boundingRect(cnt)]
-            if w * h >= self.MIN_BLOB_AREA
-        ]
-        if not rects:
-            return [(0, 0, page_bgr)]
-        merged = self._merge_rects(rects, tw, th)
-        return [
-            (
-                max(x1 - tw, 0),
-                max(y1 - th, 0),
-                page_bgr[
-                    max(y1 - th, 0) : min(y2 + th, ph),
-                    max(x1 - tw, 0) : min(x2 + tw, pw),
-                ],
-            )
-            for x1, y1, x2, y2 in merged
-        ]
-
-    def _dominant_color(self, samples):
-        all_fg = []
-        for s in samples:
-            hsv = cv2.cvtColor(s.image, cv2.COLOR_BGR2HSV)
-            fg = (
-                hsv[s.mask > 0]
-                if s.mask is not None and s.mask.shape == s.image.shape[:2]
-                else hsv.reshape(-1, 3)
-            )
-            all_fg.append(fg)
-        fg = np.concatenate(all_fg) if all_fg else np.empty((0, 3), dtype=np.uint8)
-        if len(fg) == 0:
-            return 0, 0
-        sat = fg[:, 1].astype(float)
-        weights = sat / (sat.sum() + 1e-6)
-        return int(np.average(fg[:, 0], weights=weights)), int(fg[:, 1].mean())
-
-    def _merge_rects(self, rects, tw, th):
-        changed = True
-        while changed:
-            changed = False
-            merged = []
-            used = [False] * len(rects)
-            for i, a in enumerate(rects):
-                if used[i]:
-                    continue
-                ax1, ay1, ax2, ay2 = a
-                for j, b in enumerate(rects):
-                    if i == j or used[j]:
-                        continue
-                    bx1, by1, bx2, by2 = b
-                    if (
-                        ax2 + tw >= bx1
-                        and bx2 + tw >= ax1
-                        and ay2 + th >= by1
-                        and by2 + th >= ay1
-                    ):
-                        ax1, ay1 = min(ax1, bx1), min(ay1, by1)
-                        ax2, ay2 = max(ax2, bx2), max(ay2, by2)
-                        used[j] = True
-                        changed = True
-                merged.append([ax1, ay1, ax2, ay2])
-                used[i] = True
-            rects = merged
-        return rects
-
-    def _nms(self, boxes, overlap=0.3):
-        if not boxes:
-            return []
-        boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-        kept = []
-        for box in boxes:
-            x1, y1, x2, y2 = box[:4]
-            for kb in kept:
-                kx1, ky1, kx2, ky2 = kb[:4]
-                ix1, iy1 = max(x1, kx1), max(y1, ky1)
-                ix2, iy2 = min(x2, kx2), min(y2, ky2)
-                if (
-                    ix2 > ix1
-                    and iy2 > iy1
-                    and (ix2 - ix1) * (iy2 - iy1) / ((x2 - x1) * (y2 - y1)) > overlap
-                ):
-                    break
-            else:
-                kept.append(box)
-        return kept
 
 
 class CountSymbols(Task):
@@ -2043,7 +1928,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            self._controller.dispatch(ImportDrawing(path))
+            self._controller.dispatch_async(ImportDrawing(path), "Importing drawing…")
         except MemoryError:
             QMessageBox.critical(
                 self, "Import Failed", "Not enough memory to import this drawing."
