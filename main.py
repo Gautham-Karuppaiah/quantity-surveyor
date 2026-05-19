@@ -62,7 +62,6 @@ from PyQt6.QtCore import (
     QObject,
     QPointF,
     pyqtSignal,
-    QTimer,
     QThread,
 )
 
@@ -360,7 +359,10 @@ class AddLegendEntries(Task):
             entry.image_data = img_buf.tobytes()
             entry.mask_data = mask_buf.tobytes()
             session.add(entry)
-        project.add_legend_entries(self.entries)
+        project.legend_entries.extend(self.entries)
+
+    def notify(self, project):
+        project.notify_legend_entries_changed()
 
 
 class SetLegendSample(Task):
@@ -385,7 +387,9 @@ class SetLegendSample(Task):
         session.flush()
         self._entry.samples.append(sample)
         self._entry.dirty = True
-        project.set_legend_entry_sample(self._entry)
+
+    def notify(self, project):
+        project.notify_legend_entries_changed()
 
 
 class AddLegendEntryFromSample(Task):
@@ -415,7 +419,10 @@ class AddLegendEntryFromSample(Task):
         entry.samples.append(sample)
         session.add(entry)
         session.flush()
-        project.add_legend_entries([entry])
+        project.legend_entries.append(entry)
+
+    def notify(self, project):
+        project.notify_legend_entries_changed()
 
 
 class RemoveLegendEntry(Task):
@@ -426,12 +433,8 @@ class RemoveLegendEntry(Task):
         session.delete(self._entry)
         session.flush()
         project.legend_entries.remove(self._entry)
-        for drawing in project.drawings:
-            for page in drawing.pages:
-                if page.pixmap is not None:
-                    page.markers[:] = [
-                        m for m in page.markers if m.legend_entry_id != self._entry.id
-                    ]
+
+    def notify(self, project):
         project.notify_legend_entries_changed()
         project.notify_markers_changed()
 
@@ -446,6 +449,8 @@ class RemoveSample(Task):
         session.delete(self._sample)
         session.flush()
         self._entry.dirty = True
+
+    def notify(self, project):
         project.notify_legend_entries_changed()
 
 
@@ -457,6 +462,8 @@ class RenameLegendEntry(Task):
     def execute(self, project, session):
         self._entry.label = self._label
         session.flush()
+
+    def notify(self, project):
         project.notify_legend_entries_changed()
 
 
@@ -486,7 +493,8 @@ class LoadProject(Task):
                 )
                 sample.pixmap = bgr_to_qpixmap(sample.image)
         if legend_entries:
-            project.add_legend_entries(legend_entries)
+            project.legend_entries.extend(legend_entries)
+            project.notify_legend_entries_changed()
 
         state = session.scalar(select(ProjectState))
         if not state or state.last_opened_drawing_id is None:
@@ -601,13 +609,6 @@ class Project(QObject):
         self.drawings.append(drawing)
         self.drawings_changed.emit()
 
-    def add_legend_entries(self, entries: list[LegendEntry]):
-        self._legend_entries.extend(entries)
-        self.legend_entries_changed.emit()
-
-    def set_legend_entry_sample(self, entry: LegendEntry):
-        self.legend_entries_changed.emit()
-
     def notify_legend_entries_changed(self):
         self.legend_entries_changed.emit()
 
@@ -679,11 +680,12 @@ class AddMarker(Command):
         self._page.markers.append(self._marker)
         session.add(self._marker)
         session.flush()
-        project.notify_markers_changed()
 
     def undo(self, project, session):
         self._page.markers.remove(self._marker)
         session.delete(self._marker)
+
+    def notify(self, project):
         project.notify_markers_changed()
 
 
@@ -695,7 +697,6 @@ class DeleteMarker(Command):
     def execute(self, project, session):
         self._page.markers.remove(self._marker)
         session.delete(self._marker)
-        project.notify_markers_changed()
 
     def undo(self, project, session):
         make_transient(self._marker)
@@ -703,6 +704,8 @@ class DeleteMarker(Command):
         self._page.markers.append(self._marker)
         session.add(self._marker)
         session.flush()
+
+    def notify(self, project):
         project.notify_markers_changed()
 
 
@@ -715,11 +718,12 @@ class AddZone(Command):
         self._page.zones.append(self._zone)
         session.add(self._zone)
         session.flush()
-        project.notify_zones_changed()
 
     def undo(self, project, session):
         self._page.zones.remove(self._zone)
         session.delete(self._zone)
+
+    def notify(self, project):
         project.notify_zones_changed()
 
 
@@ -731,7 +735,6 @@ class DeleteZone(Command):
     def execute(self, project, session):
         self._page.zones.remove(self._zone)
         session.delete(self._zone)
-        project.notify_zones_changed()
 
     def undo(self, project, session):
         make_transient(self._zone)
@@ -739,6 +742,8 @@ class DeleteZone(Command):
         self._page.zones.append(self._zone)
         session.add(self._zone)
         session.flush()
+
+    def notify(self, project):
         project.notify_zones_changed()
 
 
@@ -1309,10 +1314,6 @@ class AppController(QObject):
         self._canvas = None
         self._thread: QThread | None = None
         self._worker: QObject | None = None
-        self._autosave_timer = QTimer()
-        self._autosave_timer.setInterval(30_000)
-        self._autosave_timer.timeout.connect(self._autosave)
-        self._autosave_timer.start()
         project.active_drawing_changed.connect(self._on_active_drawing_changed)
 
     @property
@@ -1342,6 +1343,9 @@ class AppController(QObject):
                 page.redo_stack.clear()
         else:
             task.execute(self._project, self._session)
+        self._session.commit()
+        if hasattr(task, "notify"):
+            task.notify(self._project)
 
     def dispatch_async(self, task: Task, label: str):
         self._session.commit()
@@ -1371,6 +1375,8 @@ class AppController(QObject):
             cmd = page.undo_stack.pop()
             cmd.undo(self._project, self._session)
             page.redo_stack.append(cmd)
+            self._session.commit()
+            cmd.notify(self._project)
 
     def redo(self):
         page = self._project.active_page
@@ -1378,6 +1384,8 @@ class AppController(QObject):
             cmd = page.redo_stack.pop()
             cmd.execute(self._project, self._session)
             page.undo_stack.append(cmd)
+            self._session.commit()
+            cmd.notify(self._project)
 
     def cancel_tool(self):
         self.set_tool(None)
@@ -1386,10 +1394,6 @@ class AppController(QObject):
         if self._session:
             self._session.commit()
             self._session.close()
-
-    def _autosave(self):
-        if self._session and self._thread is None:
-            self._session.commit()
 
     def _on_active_drawing_changed(self):
         if not self._session or not self._project.active_drawing:
