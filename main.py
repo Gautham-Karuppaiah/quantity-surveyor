@@ -19,6 +19,7 @@ from sqlalchemy.orm import (
     relationship,
     Session,
     make_transient,
+    reconstructor,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -70,7 +71,7 @@ from PyQt6.QtCore import (
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
-DPI = 600
+DPI = 300
 WHITE_THRESHOLD = 240
 
 
@@ -102,6 +103,10 @@ class Drawing(Base):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._init_transient()
+
+    @reconstructor
+    def _init_transient(self):
         self.last_page_index: int = 0
 
 
@@ -122,6 +127,10 @@ class Page(Base):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._init_transient()
+
+    @reconstructor
+    def _init_transient(self):
         self.pixmap: QPixmap | None = None
         self.undo_stack = deque(maxlen=100)
         self.redo_stack = deque()
@@ -144,6 +153,10 @@ class LegendEntry(Base):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._init_transient()
+
+    @reconstructor
+    def _init_transient(self):
         self.image: np.ndarray | None = None
         self.mask: np.ndarray | None = None
         self.pixmap: QPixmap | None = None
@@ -161,6 +174,10 @@ class Sample(Base):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._init_transient()
+
+    @reconstructor
+    def _init_transient(self):
         self.image: np.ndarray | None = None
         self.mask: np.ndarray | None = None
         self.pixmap: QPixmap | None = None
@@ -1597,7 +1614,7 @@ class DrawingsPanel(QDockWidget):
         self._project = controller.project
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
-        self._tree.itemDoubleClicked.connect(self._on_double_click)
+        self._tree.itemClicked.connect(self._on_click)
         self.setWidget(self._tree)
         self._project.drawings_changed.connect(self._rebuild)
         self._project.active_page_changed.connect(self._rebuild)
@@ -1609,16 +1626,19 @@ class DrawingsPanel(QDockWidget):
         for drawing in self._project.drawings:
             d_item = QTreeWidgetItem([drawing.name])
             d_item.setData(0, Qt.ItemDataRole.UserRole, drawing)
-            for page in drawing.pages:
-                p_item = QTreeWidgetItem([f"Page {page.page_number + 1}"])
-                p_item.setData(0, Qt.ItemDataRole.UserRole, page)
-                d_item.addChild(p_item)
-                if page is active_page:
-                    p_item.setSelected(True)
+            if len(drawing.pages) > 1:
+                for page in drawing.pages:
+                    p_item = QTreeWidgetItem([f"Page {page.page_number + 1}"])
+                    p_item.setData(0, Qt.ItemDataRole.UserRole, page)
+                    d_item.addChild(p_item)
+                    if page is active_page:
+                        p_item.setSelected(True)
+                d_item.setExpanded(True)
+            elif drawing.pages and drawing.pages[0] is active_page:
+                d_item.setSelected(True)
             self._tree.addTopLevelItem(d_item)
-            d_item.setExpanded(True)
 
-    def _on_double_click(self, item, _column):
+    def _on_click(self, item, _column):
         obj = item.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(obj, Page):
             self._controller.dispatch(SwitchPage(obj))
@@ -1879,6 +1899,9 @@ class MainWindow(QMainWindow):
         controller.task_finished.connect(self._on_task_finished)
         controller.task_progress.connect(self._on_task_progress)
 
+        self._import_queue: deque[str] = deque()
+        controller.task_finished.connect(self._drain_import_queue)
+
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self.legend_panel.toggleViewAction())
         view_menu.addAction(self.zone_counts_panel.toggleViewAction())
@@ -2019,19 +2042,34 @@ class MainWindow(QMainWindow):
         self._controller.dispatch(ExportProject(path))
 
     def _import_drawing(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import Drawing", "", "PDF Files (*.pdf)"
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import Drawings", "", "PDF Files (*.pdf)"
         )
-        if not path:
+        if not paths:
             return
+        self._import_queue.extend(paths)
+        if self._controller._thread is None:
+            self._drain_import_queue()
+
+    def _drain_import_queue(self):
+        if not self._import_queue:
+            return
+        path = self._import_queue.popleft()
         try:
-            self._controller.dispatch_async(ImportDrawing(path), "Importing drawing…")
+            self._controller.dispatch_async(
+                ImportDrawing(path),
+                f"Importing {os.path.basename(path)}…",
+            )
         except MemoryError:
             QMessageBox.critical(
-                self, "Import Failed", "Not enough memory to import this drawing."
+                self,
+                "Import Failed",
+                f"Not enough memory to import {os.path.basename(path)}.",
             )
+            self._drain_import_queue()
         except OSError as e:
             QMessageBox.critical(self, "Import Failed", f"Disk error: {e}")
+            self._drain_import_queue()
 
 
 if __name__ == "__main__":
