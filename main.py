@@ -1349,8 +1349,8 @@ class AppController(QObject):
     def _on_async_done(self, task: Task):
         if hasattr(task, "complete"):
             task.complete(self._project, self._session)
-        self.task_finished.emit()
         self._thread = None
+        self.task_finished.emit()
 
     def undo(self):
         page = self._project.active_page
