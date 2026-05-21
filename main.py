@@ -787,6 +787,9 @@ class AddMarker(Command):
     def undo(self, project, session):
         self._page.markers.remove(self._marker)
         session.delete(self._marker)
+        session.flush()
+        make_transient(self._marker)
+        self._marker.id = None
 
     def notify(self, project):
         project.notify_markers_changed()
@@ -825,6 +828,9 @@ class AddZone(Command):
     def undo(self, project, session):
         self._page.zones.remove(self._zone)
         session.delete(self._zone)
+        session.flush()
+        make_transient(self._zone)
+        self._zone.id = None
 
     def notify(self, project):
         project.notify_zones_changed()
