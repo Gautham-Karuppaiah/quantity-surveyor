@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeView,
     QHeaderView,
     QWidget,
     QVBoxLayout,
@@ -53,6 +54,7 @@ from PyQt6.QtGui import (
     QPixmap,
     QImage,
     QPen,
+    QBrush,
     QColor,
     QIcon,
     QImageReader,
@@ -65,6 +67,8 @@ from PyQt6.QtCore import (
     QSize,
     QObject,
     QPointF,
+    QModelIndex,
+    QAbstractItemModel,
     pyqtSignal,
     QThread,
     QTimer,
@@ -331,16 +335,20 @@ def load_page(page: Page, session: Session) -> None:
     _ = page.zones
 
 
-def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
-    bgr = qpixmap_to_bgr(pixmap)
+def extract_legend_data(bgr: np.ndarray):
+    print(f"[legend] input image: {bgr.shape[1]}x{bgr.shape[0]}px")
     _, buf = cv2.imencode(".png", bgr)
     ocr = EasyOCR(lang=["en"])
     doc = TableImage(src=buf.tobytes())
     tables = doc.extract_tables(ocr=ocr)
+    print(f"[legend] tables found: {len(tables)}")
     entries = []
-    for table in tables:
-        for row in table.content.values():
+    for t_idx, table in enumerate(tables):
+        rows = list(table.content.values())
+        print(f"[legend] table {t_idx}: {len(rows)} rows")
+        for row in rows:
             if len(row) < 2:
+                print(f"[legend]   skipped row (only {len(row)} cell(s))")
                 continue
             symbol_cell, label_cell = row[0], row[1]
             label = " ".join((label_cell.value or "").split())
@@ -348,14 +356,18 @@ def extract_legend(pixmap: QPixmap) -> list[LegendEntry]:
             bx2, by2 = symbol_cell.bbox.x2, symbol_cell.bbox.y2
             cell_bgr = bgr[by1:by2, bx1:bx2]
             if cell_bgr.size == 0:
+                print(
+                    f"[legend]   skipped '{label}': empty crop at ({bx1},{by1})-({bx2},{by2})"
+                )
                 continue
             clean = tight_crop(remove_border(cell_bgr))
             mask = (clean.min(axis=2) < WHITE_THRESHOLD).astype(np.uint8) * 255
-            entry = LegendEntry(label=label)
-            entry.image = clean
-            entry.mask = mask
-            entry.pixmap = bgr_to_qpixmap(clean)
-            entries.append(entry)
+            nonzero = int(mask.sum() / 255)
+            print(
+                f"[legend]   entry '{label}': crop {clean.shape[1]}x{clean.shape[0]}px, {nonzero} mask px"
+            )
+            entries.append((label, clean, mask))
+    print(f"[legend] done: {len(entries)} entries extracted")
     return entries
 
 
@@ -369,20 +381,41 @@ class Command(Task):
         raise NotImplementedError
 
 
-class AddLegendEntries(Task):
-    def __init__(self, entries: list[LegendEntry]):
-        self.entries = entries
+class AsyncTask:
+    def prepare(self, project, session):
+        return None
 
-    def execute(self, project, session):
-        for entry in self.entries:
-            _, img_buf = cv2.imencode(".png", entry.image)
-            _, mask_buf = cv2.imencode(".png", entry.mask)
+    def run(self, payload, engine, progress):
+        raise NotImplementedError
+
+    def apply(self, project, session, result):
+        pass
+
+
+class ExtractLegend(AsyncTask):
+    def __init__(self, crop_bgr: np.ndarray):
+        self._crop_bgr = crop_bgr
+
+    def prepare(self, project, session):
+        return self._crop_bgr
+
+    def run(self, payload, engine, progress):
+        return extract_legend_data(payload)
+
+    def apply(self, project, session, result):
+        entries = []
+        for label, image, mask in result:
+            _, img_buf = cv2.imencode(".png", image)
+            _, mask_buf = cv2.imencode(".png", mask)
+            entry = LegendEntry(label=label)
+            entry.image = image
+            entry.mask = mask
+            entry.pixmap = bgr_to_qpixmap(image)
             entry.image_data = img_buf.tobytes()
             entry.mask_data = mask_buf.tobytes()
             session.add(entry)
-        project.legend_entries.extend(self.entries)
-
-    def notify(self, project):
+            entries.append(entry)
+        project.legend_entries.extend(entries)
         project.notify_legend_entries_changed()
 
 
@@ -563,27 +596,31 @@ class SwitchDrawing(Task):
         project.active_page = page
 
 
-class ImportDrawing(Task):
+class ImportDrawing(AsyncTask):
     def __init__(self, path: str):
         self.path = path
-        self._progress_cb = None
 
-    def execute(self, project, session):
-        doc = fitz.open(self.path)
+    def prepare(self, project, session):
+        return self.path
+
+    def run(self, payload, engine, progress):
+        doc = fitz.open(payload)
         total = len(doc)
-        drawing = Drawing(name=os.path.basename(self.path))
-        session.add(drawing)
-        for i in range(total):
-            page = Page(page_number=i, image_data=render_page_bytes(doc, i))
-            drawing.pages.append(page)
-            if self._progress_cb:
-                self._progress_cb(i + 1, total)
-        session.flush()
+        with Session(engine) as session:
+            drawing = Drawing(name=os.path.basename(payload))
+            session.add(drawing)
+            for i in range(total):
+                page = Page(page_number=i, image_data=render_page_bytes(doc, i))
+                drawing.pages.append(page)
+                progress(i + 1, total)
+            session.flush()
+            drawing_id = drawing.id
+            session.commit()
         doc.close()
-        self._drawing_id = drawing.id
+        return drawing_id
 
-    def complete(self, project, session):
-        drawing = session.get(Drawing, self._drawing_id)
+    def apply(self, project, session, result):
+        drawing = session.get(Drawing, result)
         drawing.last_page_index = 0
         project.add_drawing(drawing)
         project.active_drawing = drawing
@@ -676,6 +713,7 @@ class Project(QObject):
     legend_entries_changed = pyqtSignal()
     active_page_changed = pyqtSignal()
     active_drawing_changed = pyqtSignal()
+    active_legend_entry_changed = pyqtSignal()
     drawings_changed = pyqtSignal()
     markers_changed = pyqtSignal()
     zones_changed = pyqtSignal()
@@ -685,7 +723,17 @@ class Project(QObject):
         self._legend_entries: list[LegendEntry] = []
         self._active_page: Page | None = None
         self._active_drawing: Drawing | None = None
+        self._active_legend_entry: LegendEntry | None = None
         self.drawings: list[Drawing] = []
+
+    @property
+    def active_legend_entry(self):
+        return self._active_legend_entry
+
+    @active_legend_entry.setter
+    def active_legend_entry(self, entry: "LegendEntry | None"):
+        self._active_legend_entry = entry
+        self.active_legend_entry_changed.emit()
 
     @property
     def active_drawing(self):
@@ -740,6 +788,10 @@ class RectGesture:
             self._canvas.clear_preview()
         self._canvas = None
 
+    @property
+    def is_started(self):
+        return self._anchor is not None
+
     def on_press(self, pos: QPointF):
         self._anchor = pos
 
@@ -761,7 +813,9 @@ def start_legend_select(controller):
     def on_complete(rect):
         crop = controller.canvas.crop(rect)
         if not crop.isNull():
-            controller.dispatch(AddLegendEntries(extract_legend(crop)))
+            controller.dispatch_async(
+                ExtractLegend(qpixmap_to_bgr(crop)), "Extracting legend…"
+            )
         controller.set_tool(None)
 
     controller.set_tool(RectGesture(on_complete=on_complete))
@@ -959,76 +1013,73 @@ class TaskWorker(QObject):
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int)
 
-    def __init__(self, task, project, engine):
+    def __init__(self, task, payload, engine):
         super().__init__()
         self._task = task
-        self._project = project
+        self._payload = payload
         self._engine = engine
+        self.result = None
+        self.ok = False
 
     def run(self):
-        session = Session(self._engine)
         try:
-            if hasattr(self._task, "_progress_cb"):
-                self._task._progress_cb = self.progress.emit
-            self._task.execute(self._project, session)
-            session.commit()
+            self.result = self._task.run(
+                self._payload, self._engine, self.progress.emit
+            )
+            self.ok = True
         except Exception as e:
-            session.rollback()
             self.error.emit(str(e))
         finally:
-            session.close()
-        self.finished.emit()
+            self.finished.emit()
 
 
-class CountSymbols(Task):
+class CountSymbols(AsyncTask):
     THRESHOLD = 0.6
     COLOR_SAT_MIN = 30
     HUE_TOLERANCE = 12
     MIN_BLOB_AREA = 16
 
-    def __init__(self, page_id: int, page_bgr: np.ndarray, entries: list[LegendEntry]):
+    def __init__(self, page_id: int, page_bgr: np.ndarray, entry_ids: list[int]):
         self._page_id = page_id
         self._page_bgr = page_bgr
-        self._entries = entries
-        self._progress_cb = None
+        self._entry_ids = entry_ids
 
-    def execute(self, project, session):
-        entry_ids = {e.id for e in self._entries}
-        for m in (
-            session.execute(
-                select(Marker).where(
-                    Marker.page_id == self._page_id,
-                    Marker.source == "auto",
-                    Marker.legend_entry_id.in_(entry_ids),
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            session.delete(m)
-        session.flush()
-
-        manual = (
+    def prepare(self, project, session):
+        entries_data = []
+        for entry_id in self._entry_ids:
+            entry = session.get(LegendEntry, entry_id)
+            samples = [(s.image, s.mask) for s in entry.samples]
+            entries_data.append((entry_id, samples))
+        manual_by_entry = {}
+        rows = (
             session.execute(
                 select(Marker).where(
                     Marker.page_id == self._page_id,
                     Marker.source == "manual",
-                    Marker.legend_entry_id.in_(entry_ids),
+                    Marker.legend_entry_id.in_(self._entry_ids),
                 )
             )
             .scalars()
             .all()
         )
+        for m in rows:
+            manual_by_entry.setdefault(m.legend_entry_id, []).append(
+                (m.x, m.y, m.w, m.h)
+            )
+        return (entries_data, manual_by_entry)
 
+    def run(self, payload, engine, progress):
+        entries_data, manual_by_entry = payload
         ph, pw = self._page_bgr.shape[:2]
-        total = len(self._entries)
-        for i, entry in enumerate(self._entries):
-            entry_manual = [m for m in manual if m.legend_entry_id == entry.id]
-            patches = self._color_patches(entry.samples, self._page_bgr, pw, ph)
+        total = len(entries_data)
+        results = []
+        for i, (entry_id, samples) in enumerate(entries_data):
+            manual_boxes = manual_by_entry.get(entry_id, [])
+            patches = self._color_patches(samples, self._page_bgr, pw, ph)
             all_boxes = []
-            for sample in entry.samples:
-                rotations = [sample.image] + [
-                    cv2.rotate(sample.image, f)
+            for image, mask in samples:
+                rotations = [image] + [
+                    cv2.rotate(image, f)
                     for f in (
                         cv2.ROTATE_90_CLOCKWISE,
                         cv2.ROTATE_180,
@@ -1064,40 +1115,58 @@ class CountSymbols(Task):
                             )
             for x1, y1, x2, y2, score in self._nms(all_boxes):
                 if any(
-                    x1 < m.x + m.w and x2 > m.x and y1 < m.y + m.h and y2 > m.y
-                    for m in entry_manual
+                    x1 < mx + mw and x2 > mx and y1 < my + mh and y2 > my
+                    for (mx, my, mw, mh) in manual_boxes
                 ):
                     continue
-                session.add(
-                    Marker(
-                        legend_entry_id=entry.id,
-                        page_id=self._page_id,
-                        x=x1,
-                        y=y1,
-                        w=x2 - x1,
-                        h=y2 - y1,
-                        score=score,
-                        source="auto",
-                    )
-                )
-            if self._progress_cb:
-                self._progress_cb(i + 1, total)
+                results.append((entry_id, x1, y1, x2 - x1, y2 - y1, score))
+            progress(i + 1, total)
+        return results
 
-    def complete(self, project, session):
+    def apply(self, project, session, result):
+        existing = (
+            session.execute(
+                select(Marker).where(
+                    Marker.page_id == self._page_id,
+                    Marker.source == "auto",
+                    Marker.legend_entry_id.in_(self._entry_ids),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for m in existing:
+            session.delete(m)
+        session.flush()
+        for entry_id, x, y, w, h, score in result:
+            session.add(
+                Marker(
+                    legend_entry_id=entry_id,
+                    page_id=self._page_id,
+                    x=x,
+                    y=y,
+                    w=w,
+                    h=h,
+                    score=score,
+                    source="auto",
+                )
+            )
+        session.flush()
         page = project.active_page
         if page and page.id == self._page_id:
             session.expire(page, ["markers"])
             _ = page.markers
-        for e in self._entries:
-            e.dirty = False
+        for e in project.legend_entries:
+            if e.id in self._entry_ids:
+                e.dirty = False
         project.notify_markers_changed()
 
     def _color_patches(self, samples, page_bgr, pw, ph):
         dominant_hue, dominant_sat = self._dominant_color(samples)
         if dominant_sat < self.COLOR_SAT_MIN:
             return [(0, 0, page_bgr)]
-        tw = max(s.image.shape[1] for s in samples)
-        th = max(s.image.shape[0] for s in samples)
+        tw = max(image.shape[1] for image, mask in samples)
+        th = max(image.shape[0] for image, mask in samples)
         page_hsv = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2HSV)
         hue = dominant_hue
         lo1 = np.array(
@@ -1147,11 +1216,11 @@ class CountSymbols(Task):
 
     def _dominant_color(self, samples):
         all_fg = []
-        for s in samples:
-            hsv = cv2.cvtColor(s.image, cv2.COLOR_BGR2HSV)
+        for image, mask in samples:
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             fg = (
-                hsv[s.mask > 0]
-                if s.mask is not None and s.mask.shape == s.image.shape[:2]
+                hsv[mask > 0]
+                if mask is not None and mask.shape == image.shape[:2]
                 else hsv.reshape(-1, 3)
             )
             all_fg.append(fg)
@@ -1236,10 +1305,11 @@ class PointGesture:
         pass
 
 
-def start_add_marker(controller, entry: LegendEntry):
+def start_add_marker(controller):
     def on_click(pos: QPointF):
         page = controller.project.active_page
-        if page is None:
+        entry = controller.project.active_legend_entry
+        if page is None or entry is None:
             return
         img = entry.samples[0].image if entry.samples else entry.image
         th, tw = img.shape[:2]
@@ -1265,12 +1335,14 @@ def start_delete_marker(controller):
     controller.set_tool(PointGesture(on_click))
 
 
-def start_set_symbol(controller, entry: LegendEntry):
+def start_set_symbol(controller):
     def on_complete(rect):
+        entry = controller.project.active_legend_entry
+        if entry is None:
+            return
         crop = controller.canvas.crop(rect)
         if not crop.isNull():
             controller.dispatch(SetLegendSample(entry, qpixmap_to_bgr(crop)))
-        controller.set_tool(None)
 
     controller.set_tool(RectGesture(on_complete=on_complete))
 
@@ -1337,26 +1409,29 @@ class AppController(QObject):
         if hasattr(task, "notify"):
             task.notify(self._project)
 
-    def dispatch_async(self, task: Task, label: str):
+    def dispatch_async(self, task, label):
         self._session.commit()
-        worker = TaskWorker(task, self._project, self._engine)
+        payload = task.prepare(self._project, self._session)
+        worker = TaskWorker(task, payload, self._engine)
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.task_progress)
         worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda: self._on_async_done(task))
+        thread.finished.connect(lambda: self._on_async_done(task, worker))
         self._thread = thread
         self._worker = worker
         self.task_started.emit(label)
         thread.start()
 
-    def _on_async_done(self, task: Task):
-        if hasattr(task, "complete"):
-            task.complete(self._project, self._session)
+    def _on_async_done(self, task, worker):
+        if worker.ok:
+            task.apply(self._project, self._session, worker.result)
+            self._session.commit()
+        worker.deleteLater()
         self._thread = None
+        self._worker = None
         self.task_finished.emit()
 
     def undo(self):
@@ -1450,11 +1525,9 @@ class PDFViewer(QGraphicsView):
             pen = QPen(color)
             pen.setWidth(3)
             pen.setCosmetic(True)
-            fill = QColor(color)
-            fill.setAlpha(40)
             item = QGraphicsRectItem(QRectF(marker.x, marker.y, marker.w, marker.h))
             item.setPen(pen)
-            item.setBrush(fill)
+            item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             item.setData(0, marker.id)
             self._scene.addItem(item)
             self._overlay_items.append(item)
@@ -1659,6 +1732,90 @@ class DrawingsPanel(QDockWidget):
             self._controller.dispatch(SwitchDrawing(obj))
 
 
+class LegendModel(QAbstractItemModel):
+    def __init__(self, project: "Project"):
+        super().__init__()
+        self._project = project
+        project.legend_entries_changed.connect(self._on_entries_changed)
+        project.markers_changed.connect(self._on_markers_changed)
+        project.active_page_changed.connect(self._on_markers_changed)
+
+    def _on_entries_changed(self):
+        self.beginResetModel()
+        self.endResetModel()
+
+    def _on_markers_changed(self):
+        entries = self._project.legend_entries
+        if entries:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(entries) - 1, 0),
+                [Qt.ItemDataRole.DisplayRole],
+            )
+
+    def _marker_counts(self):
+        page = self._project.active_page
+        counts = {}
+        if page:
+            for m in page.markers:
+                counts[m.legend_entry_id] = counts.get(m.legend_entry_id, 0) + 1
+        return counts
+
+    def index(self, row, col, parent=QModelIndex()):
+        if not self.hasIndex(row, col, parent):
+            return QModelIndex()
+        if not parent.isValid():
+            return self.createIndex(row, col, self._project.legend_entries[row])
+        entry = parent.internalPointer()
+        return self.createIndex(row, col, entry.samples[row])
+
+    def parent(self, index):
+        if not index.isValid():
+            return QModelIndex()
+        obj = index.internalPointer()
+        if isinstance(obj, LegendEntry):
+            return QModelIndex()
+        entry = obj.legend_entry
+        row = self._project.legend_entries.index(entry)
+        return self.createIndex(row, 0, entry)
+
+    def rowCount(self, parent=QModelIndex()):
+        if not parent.isValid():
+            return len(self._project.legend_entries)
+        obj = parent.internalPointer()
+        if isinstance(obj, LegendEntry):
+            return len(obj.samples)
+        return 0
+
+    def columnCount(self, parent=QModelIndex()):
+        return 1
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        obj = index.internalPointer()
+        if role == Qt.ItemDataRole.DisplayRole:
+            if isinstance(obj, LegendEntry):
+                count = self._marker_counts().get(obj.id, 0)
+                return f"{obj.label}  ({count})"
+            if isinstance(obj, Sample):
+                i = obj.legend_entry.samples.index(obj)
+                return f"Sample {i + 1}"
+        if role == Qt.ItemDataRole.DecorationRole:
+            if isinstance(obj, LegendEntry) and obj.pixmap:
+                return QIcon(obj.pixmap)
+            if isinstance(obj, Sample) and obj.pixmap:
+                return QIcon(obj.pixmap)
+        if role == Qt.ItemDataRole.UserRole:
+            return obj
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+
 class LegendPanel(QDockWidget):
     ICON_SIZE = 80
 
@@ -1667,13 +1824,20 @@ class LegendPanel(QDockWidget):
         self._controller = controller
         self._project = controller.project
 
-        self._tree = QTreeWidget()
+        self._model = LegendModel(self._project)
+
+        self._tree = QTreeView()
         self._tree.setHeaderHidden(True)
         self._tree.setIconSize(QSize(self.ICON_SIZE, self.ICON_SIZE))
         self._tree.setWordWrap(True)
         font = self._tree.font()
         font.setPointSize(11)
         self._tree.setFont(font)
+        self._tree.setModel(self._model)
+        self._tree.expandAll()
+        self._model.modelReset.connect(self._tree.expandAll)
+        self._model.rowsInserted.connect(self._on_rows_inserted)
+        self._tree.selectionModel().currentChanged.connect(self._on_selection_changed)
 
         self._remove_btn = QPushButton("Remove")
         self._rename_btn = QPushButton("Rename")
@@ -1692,60 +1856,36 @@ class LegendPanel(QDockWidget):
         container.setLayout(layout)
         self.setWidget(container)
 
-        self._project.legend_entries_changed.connect(self._rebuild)
-        self._project.markers_changed.connect(self._rebuild)
-        self._rebuild()
+    def _on_rows_inserted(self, parent: QModelIndex, first: int, last: int):
+        if not parent.isValid():
+            for row in range(first, last + 1):
+                self._tree.expand(self._model.index(row, 0))
 
-    def _rebuild(self):
-        self._tree.clear()
-        page = self._project.active_page
-        marker_counts = {}
-        if page:
-            for m in page.markers:
-                marker_counts[m.legend_entry_id] = (
-                    marker_counts.get(m.legend_entry_id, 0) + 1
-                )
-        for entry in self._project.legend_entries:
-            count = marker_counts.get(entry.id, 0)
-            e_item = QTreeWidgetItem([f"{entry.label}  ({count})"])
-            if entry.pixmap:
-                e_item.setIcon(0, QIcon(entry.pixmap))
-            e_item.setData(0, Qt.ItemDataRole.UserRole, entry)
-            for sample in entry.samples:
-                s_item = QTreeWidgetItem([f"Sample {entry.samples.index(sample) + 1}"])
-                if sample.pixmap:
-                    s_item.setIcon(0, QIcon(sample.pixmap))
-                s_item.setData(0, Qt.ItemDataRole.UserRole, sample)
-                e_item.addChild(s_item)
-            self._tree.addTopLevelItem(e_item)
-            e_item.setExpanded(True)
-
-    def selected_entry(self) -> LegendEntry | None:
-        item = self._tree.currentItem()
-        if item is None:
+    def selected_entry(self) -> "LegendEntry | None":
+        index = self._tree.currentIndex()
+        if not index.isValid():
             return None
-        obj = item.data(0, Qt.ItemDataRole.UserRole)
+        obj = index.data(Qt.ItemDataRole.UserRole)
         if isinstance(obj, LegendEntry):
             return obj
         if isinstance(obj, Sample):
-            parent = item.parent()
-            if parent:
-                return parent.data(0, Qt.ItemDataRole.UserRole)
+            return index.parent().data(Qt.ItemDataRole.UserRole)
         return None
 
     def _selected_obj(self):
-        item = self._tree.currentItem()
-        return item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        index = self._tree.currentIndex()
+        return index.data(Qt.ItemDataRole.UserRole) if index.isValid() else None
+
+    def _on_selection_changed(self):
+        self._project.active_legend_entry = self.selected_entry()
 
     def _on_remove(self):
         obj = self._selected_obj()
         if isinstance(obj, LegendEntry):
             self._controller.dispatch(RemoveLegendEntry(obj))
         elif isinstance(obj, Sample):
-            parent = self._tree.currentItem().parent()
-            if parent:
-                entry = parent.data(0, Qt.ItemDataRole.UserRole)
-                self._controller.dispatch(RemoveSample(entry, obj))
+            entry = self._tree.currentIndex().parent().data(Qt.ItemDataRole.UserRole)
+            self._controller.dispatch(RemoveSample(entry, obj))
 
     def _on_rename(self):
         obj = self._selected_obj()
@@ -2022,27 +2162,26 @@ class MainWindow(QMainWindow):
         if not entries:
             return
         page_bgr = qpixmap_to_bgr(page.pixmap)
+        entry_ids = [e.id for e in entries]
         self._controller.dispatch_async(
-            CountSymbols(page.id, page_bgr, entries), "Counting symbols..."
+            CountSymbols(page.id, page_bgr, entry_ids), "Counting symbols..."
         )
 
     def _add_marker_mode(self):
-        entry = self.legend_panel.selected_entry()
-        if entry is None:
+        if self._controller.project.active_legend_entry is None:
             QMessageBox.information(
                 self, "No Selection", "Select a legend entry first."
             )
             return
-        start_add_marker(self._controller, entry)
+        start_add_marker(self._controller)
 
     def _set_symbol(self):
-        entry = self.legend_panel.selected_entry()
-        if entry is None:
+        if self._controller.project.active_legend_entry is None:
             QMessageBox.information(
                 self, "No Selection", "Select a legend entry first."
             )
             return
-        start_set_symbol(self._controller, entry)
+        start_set_symbol(self._controller)
 
     def _export(self):
         path, _ = QFileDialog.getSaveFileName(
