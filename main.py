@@ -67,6 +67,7 @@ from PyQt6.QtCore import (
     QPointF,
     pyqtSignal,
     QThread,
+    QTimer,
 )
 
 os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
@@ -1383,6 +1384,8 @@ class AppController(QObject):
         if self._session:
             self._session.commit()
             self._session.close()
+        if self._engine:
+            self._engine.dispose()
 
     def _on_active_drawing_changed(self):
         if not self._session or not self._project.active_drawing:
@@ -1637,12 +1640,16 @@ class DrawingsPanel(QDockWidget):
                     p_item = QTreeWidgetItem([f"Page {page.page_number + 1}"])
                     p_item.setData(0, Qt.ItemDataRole.UserRole, page)
                     d_item.addChild(p_item)
-                    if page is active_page:
-                        p_item.setSelected(True)
+                self._tree.addTopLevelItem(d_item)
                 d_item.setExpanded(True)
-            elif drawing.pages and drawing.pages[0] is active_page:
-                d_item.setSelected(True)
-            self._tree.addTopLevelItem(d_item)
+                for i in range(d_item.childCount()):
+                    p_item = d_item.child(i)
+                    if p_item.data(0, Qt.ItemDataRole.UserRole) is active_page:
+                        self._tree.setCurrentItem(p_item)
+            else:
+                self._tree.addTopLevelItem(d_item)
+                if drawing.pages and drawing.pages[0] is active_page:
+                    self._tree.setCurrentItem(d_item)
 
     def _on_click(self, item, _column):
         obj = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1839,7 +1846,7 @@ class LandingWindow(QMainWindow):
         engine = _make_engine(path)
         Base.metadata.create_all(engine)
         _init_project_state(engine)
-        self._launch(Session(engine), engine, path)
+        self._launch(Session(engine, expire_on_commit=False), engine, path)
 
     def _open_project(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1850,7 +1857,7 @@ class LandingWindow(QMainWindow):
         engine = _make_engine(path)
         Base.metadata.create_all(engine)
         _init_project_state(engine)
-        self._launch(Session(engine), engine, path)
+        self._launch(Session(engine, expire_on_commit=False), engine, path)
 
     def _launch(self, session, engine, path):
         self._controller.set_session(session, engine)
